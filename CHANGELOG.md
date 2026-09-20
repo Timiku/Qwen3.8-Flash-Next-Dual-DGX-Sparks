@@ -2,14 +2,33 @@
 
 Notable changes to this deployment. Format follows [Keep a Changelog](https://keepachangelog.com/1.1.0/).
 
+## 2026-09-20
+
+### Added
+
+- **Ported-runner A/B** — `docs/bench/port-ab-20260920.md`. The 09-19 port
+  measured through the repo's own harness (sparkDash sweep, prose+code,
+  S=1/2/4/8, 3 reps, 24/24 rows/arm, two port sessions against one base):
+  **throughput-neutral** — mean −3.2%/−2.4% across matched cells, inside the
+  session band `rerun-20260916.md` documents, acceptance per position
+  unchanged. `CUDAGRAPH_CAPTURE_SIZES=auto` is a graph-shape non-change at
+  this box's `MAX_NUM_SEQS=8, K=3` (the stock list pads to
+  `{4,8,16,24,32}`, already covering every buildable batch; the exact-vs-
+  padded probe at S=3/S=5 came flat). The port stays for its hygiene:
+  supervision, sha256 guard, graceful stop, byte-pinned vocab. The inherited
+  "full-batch widths decode eager" claim in the knob's comments is corrected
+  here — true for the single kit's `MAX_NUM_SEQS=4`, not for 8.
+
 ## 2026-09-19
 
 ### Added — improvements ported from MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark
 
 - **Decode CUDA graph coverage** (`CUDAGRAPH_CAPTURE_SIZES=auto`, on by
   default): captures every `(1+MTP)·S` width for `S` in `1..MAX_NUM_SEQS`.
-  vLLM's stock list leaves full-batch verify widths without a graph (eager
-  decode at the highest concurrency the scheduler builds).
+  vLLM's stock list graphs every buildable batch here too (it pads odd
+  batches up to the next multiple of the verify width); `auto` replays the
+  exact shape instead. Throughput effect at this shape is inside noise —
+  see the 2026-09-20 A/B below.
 - **`MTP_K_SCHEDULE`** — per-batch-size speculative depth (needs the
   `VLLM_USE_V2_MODEL_RUNNER=1` pin; documented in `.env.sample`), plus the
   `--async-scheduling` + MTP silent-corruption guard.
@@ -43,6 +62,7 @@ Notable changes to this deployment. Format follows [Keep a Changelog](https://ke
   environment-beats-`.env` via an env snapshot around `source .env`.
 - `tests/test_prompt_token_details.py` — CPU-only argv-shape check for the
   new launcher flags.
+
 ## 2026-09-16
 
 ### Added

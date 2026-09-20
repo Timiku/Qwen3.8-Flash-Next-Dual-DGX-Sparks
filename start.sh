@@ -180,11 +180,14 @@ CUDAGRAPH_MODE="${CUDAGRAPH_MODE:-FULL_DECODE_ONLY}"   # NONE for eager debug
 # CUDA graph capture sizes for decode. vLLM's default list is [1,2,4] plus
 # multiples of 8, each rounded up to a multiple of (1+MTP) and then filtered to
 # <= (1+MTP)*MAX_NUM_SEQS before it becomes a decode key. At MTP=3,
-# MAX_NUM_SEQS=8 that leaves keys {4,8,16}: a full 8-sequence verify batch is
-# 32 tokens, matches nothing, and decodes eager. "auto" captures every
-# (1+K(S))*S for S in 1..MAX_NUM_SEQS so every batch the scheduler can build
-# has a graph; a comma list sets them explicitly; empty keeps the vLLM default.
-# Capture costs ~1 s and a few MiB per size.
+# MAX_NUM_SEQS=8 that leaves keys {4,8,16,24,32}: the powers-of-two batches
+# are graphed, but an odd-sequences batch pads up (a 5-sequence verify batch
+# is 20 tokens and replays the 24-token graph, with 4 idle lanes). "auto"
+# captures every (1+K(S))*S for S in 1..MAX_NUM_SEQS so each buildable batch
+# gets its exact graph; a comma list sets them explicitly; empty keeps the
+# vLLM default. The throughput effect of exact-vs-padded is inside noise at
+# this shape (docs/bench/port-ab-20260920.md); capture costs ~1 s and a few
+# MiB per size.
 CUDAGRAPH_CAPTURE_SIZES="${CUDAGRAPH_CAPTURE_SIZES:-}"
 # Batch-size schedule for the speculative token count, as
 # "start:end:K,start:end:K" over inclusive batch-size (num_seqs) ranges. Empty
