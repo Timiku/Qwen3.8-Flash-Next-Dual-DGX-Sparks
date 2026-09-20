@@ -47,6 +47,7 @@ fi
 # Environment wins over .env for ABLIT / HF_TOKEN (same rule as start.sh).
 _CLI_HF_TOKEN="${HF_TOKEN:-}"
 _CLI_ABLIT="${ABLIT:-}"
+_CLI_VERIFY_SHA256="${VERIFY_SHA256:-}"
 # shellcheck source=.env
 source .env
 [[ -n "$_CLI_HF_TOKEN" ]] && HF_TOKEN="$_CLI_HF_TOKEN"
@@ -55,6 +56,8 @@ HF_TOKEN="${HF_TOKEN:-}"
 [[ -n "$_CLI_ABLIT" ]] && ABLIT="$_CLI_ABLIT"
 ABLIT="${ABLIT:-0}"
 [[ "$ABLIT" == "0" || "$ABLIT" == "1" ]] || err "ABLIT must be 0 or 1 (got: '$ABLIT')"
+VERIFY_SHA256="${_CLI_VERIFY_SHA256:-${VERIFY_SHA256:-1}}"
+[[ "$VERIFY_SHA256" == "0" || "$VERIFY_SHA256" == "1" ]] || err "VERIFY_SHA256 must be 0 or 1 (got: '$VERIFY_SHA256')"
 
 MODEL_ID="${MODEL_ID:-nvidia/Qwen3.8-Flash-Next-NVFP4}"
 EXPLICIT_MODEL=""
@@ -118,20 +121,23 @@ info "Downloading $MODEL_ID"
 info "Head cache: $HF_CACHE_DIR"
 info "Worker:     not updated (NFS from head at launch, or rsync via start.sh)"
 
-# Already complete? Skip. A config.json appears early in a partial download
-# and is not sufficient — every shard named by the safetensors index must exist.
+# Already complete? Require every shard named by the safetensors index. A
+# config.json appears early in a partial download and is not sufficient.
+# A complete cache still runs the sha256 guard below: "downloaded" and
+# "verified" are different claims, and a blob corrupted on disk after the
+# download is only caught by re-hashing it.
+DO_DL=true
 if [[ -d "$MODEL_PATH" ]]; then
     SNAP=""
     SNAP_RC=0
     SNAP="$(resolve_snapshot "$MODEL_PATH")" && SNAP_RC=0 || SNAP_RC=$?
     if [[ "$SNAP_RC" -eq 0 && -n "$SNAP" ]]; then
         ok "Already in cache: $MODEL_PATH ($(du -sh "$MODEL_PATH" 2>/dev/null | cut -f1))"
-        info "Nothing to do."
-        next_start_hint
-        exit 0
-    fi
-    if [[ -n "$SNAP" ]]; then
-        warn "Partial download found (snapshot $SNAP); resuming."
+        DO_DL=false
+    else
+        if [[ -n "$SNAP" ]]; then
+            warn "Partial download found (snapshot $SNAP); resuming."
+        fi
     fi
 fi
 
@@ -219,13 +225,14 @@ cli_download_or_die() {
         err "Download failed (exit $rc)"
     fi
 }
-
-info "Downloading (resumable; interrupt and rerun to continue)..."
-if [[ "$MODEL_ID" == "$ABLIT_MODEL_ID" ]] && python3 -c "import huggingface_hub" 2>/dev/null; then
-    HF_HOME="$HF_CACHE_DIR" HF_HUB_CACHE="$HUB_PATH" HF_TOKEN="$HF_TOKEN" \
-        python3 -c "$DL_PY" "$MODEL_ID" "$RETRY_HINT" "$HUB_PATH"
-else
-    cli_download_or_die
+if [[ "$DO_DL" == "true" ]]; then
+    info "Downloading (resumable; interrupt and rerun to continue)..."
+    if [[ "$MODEL_ID" == "$ABLIT_MODEL_ID" ]] && python3 -c "import huggingface_hub" 2>/dev/null; then
+        HF_HOME="$HF_CACHE_DIR" HF_HUB_CACHE="$HUB_PATH" HF_TOKEN="$HF_TOKEN" \
+            python3 -c "$DL_PY" "$MODEL_ID" "$RETRY_HINT" "$HUB_PATH"
+    else
+        cli_download_or_die
+    fi
 fi
 
 [[ -d "$MODEL_PATH" ]] || err "Download finished but $MODEL_PATH was not found"
@@ -242,5 +249,115 @@ if [[ "$SNAP_RC" -ne 0 ]]; then
   Resume with:  ./download.sh $MODEL_ID"
 fi
 
-ok "Download complete: $MODEL_PATH ($(du -sh "$MODEL_PATH" 2>/dev/null | cut -f1))"
+# ---------------------------------------------------------------------------
+# sha256 verification of LFS blobs (ported from the single-Spark kit). aria2
+# and the hub CLIs preallocate to final size, so size checks pass on corrupt
+# content; this is the only catch. VERIFY_SHA256=0 documents a skip but is not
+# the default.
+# ---------------------------------------------------------------------------
+if [[ "$VERIFY_SHA256" == "1" ]]; then
+    SNAP_DIR="$MODEL_PATH/snapshots/$SNAP"
+    STATE_FILE="$MODEL_PATH/.sha256state"
+    auth=(); [[ -n "$HF_TOKEN" ]] && auth=(-H "Authorization: Bearer $HF_TOKEN")
+
+    # Fetches the full LFS metadata manifest, walking the HF tree API with
+    # pagination (50 entries/page via the Link: rel="next" header). The
+    # manifest is <size>\t<lfs.oid>\t<path> per line, so a truncated fetch
+    # is visible in the entry count printed below.
+    fetch_manifest() {  # <cache-file>
+        local cache="$1"
+        rm -f "$cache"
+        local page=0 total=0
+        local url="https://huggingface.co/api/models/$MODEL_ID/tree/main?recursive=true&expand=true&limit=50"
+        while [[ -n "$url" ]]; do
+            local headers="$cache.headers.$page"
+            local body; body=$(curl -s -D "$headers" -m 60 "${auth[@]}" \
+                -H "Accept: application/json" "$url" || true)
+            [[ -n "$body" ]] || { rm -f "$cache" "$headers"; return 1; }
+            local bodyf; bodyf=$(mktemp)
+            printf '%s' "$body" > "$bodyf"
+            python3 - "$cache" "$bodyf" <<'PY'
+import json, sys
+cache = sys.argv[1]
+with open(cache, "a") as mf:
+    for e in json.loads(open(sys.argv[2]).read()):
+        if e.get("type") != "file":
+            continue
+        lfs = e.get("lfs", {})
+        # lfs.oid IS the sha256 (matches the blob name HF writes into the
+        # cache); the tree API has no lfs.sha256 key.
+        print(f"{e.get('size', 0)}\t{lfs.get('oid', '')}\t{e.get('path', '')}", file=mf)
+PY
+            rm -f "$bodyf"
+            total=$(grep -c . "$cache" 2>/dev/null || echo 0)
+            page=$((page + 1))
+            url=""
+            if [[ -f "$headers" ]]; then
+                url=$(tr -d '\r' < "$headers" | grep -i '^Link:' \
+                    | sed -nE 's/.*<([^>]*)>; rel="next".*/\1/p' || true)
+                rm -f "$headers"
+            fi
+            [[ -n "$url" ]] && url=$(printf '%s' "$url" | tr -d '[:space:]')
+        done
+        [[ -s "$cache" ]] || return 1
+        echo "$total"
+        return 0
+    }
+
+    MANIFEST=$(mktemp)
+    ENTRY_COUNT=0
+    ENTRY_COUNT=$(fetch_manifest "$MANIFEST" 2>/dev/null || echo "")
+    if [[ -z "$ENTRY_COUNT" ]]; then
+        warn "sha256 verification: could not fetch the LFS manifest (offline?); skipping verification."
+        warn "     Rerun with network to get the corrupt-blob guard."
+    else
+        info "verifying sha256: ${ENTRY_COUNT} files in the remote tree manifest"
+        {
+            # Fewer remote entries than local LFS-sized files means the
+            # pagination walk came up short (jschmied: 50 of 144 "verified"
+            # cleanly).
+            _LOCAL_LFS=$(find "$SNAP_DIR" -type f -size +1M 2>/dev/null | wc -l)
+            if (( ENTRY_COUNT < _LOCAL_LFS )); then
+                err "tree manifest records ${ENTRY_COUNT} files but the snapshot has ${_LOCAL_LFS} LFS-sized files — the manifest is truncated (pagination regression). Aborting verification."
+            fi
+            _resume=1
+            if grep -q '^complete ' "$STATE_FILE" 2>/dev/null; then
+                _resume=0
+                { : > "$STATE_FILE"; } 2>/dev/null || true
+            fi
+            while IFS=$'\t' read -r _sz sha path; do
+                # Manifest-controlled path must stay inside the snapshot: reject
+                # traversal and anything that is not a plain relative path.
+                case "$path" in
+                    *".."*|/*|*[[:space:]]*|*[^[:print:]]*|"")
+                        err "sha256 verify: manifest path '$path' is not a safe relative path; aborting."
+                        ;;
+                esac
+                f="$SNAP_DIR/$path"
+                [[ -f "$f" ]] || err "sha256 verify: $path missing from snapshot"
+                _done=0
+                if [[ "$_resume" == "1" && -f "$STATE_FILE" ]]; then
+                    grep -qxF "$sha  $path" "$STATE_FILE" 2>/dev/null && _done=1
+                fi
+                if [[ "$_done" != "1" ]]; then
+                    _have=$(sha256sum "$f" 2>/dev/null | cut -d' ' -f1 || echo "")
+                    if [[ "$_have" != "$sha" ]]; then
+                        err "sha256 mismatch on $path (got ${_have:-no-file}, want $sha). The checkpoint is corrupt or incomplete; remove $(readlink -f "$f") and rerun ./download.sh $MODEL_ID to fetch it again."
+                    fi
+                    if ! { printf '%s  %s\n' "$sha" "$path" >> "$STATE_FILE"; } 2>/dev/null; then
+                        if [[ "${_state_warned:-0}" != "1" ]]; then
+                            warn "cannot write the sha256 resume state ($STATE_FILE); verification still complete, but the next run will re-hash every blob."
+                            _state_warned=1
+                        fi
+                    fi
+                fi
+            done < <(awk -F'\t' 'NF >= 3 && length($2) == 64 { print }' "$MANIFEST")
+            { printf 'complete %s\n' "$SNAP" >> "$STATE_FILE"; } 2>/dev/null || true
+            ok "sha256 verified all LFS blobs in snapshot $SNAP."
+        }
+    fi
+    rm -f "$MANIFEST"
+fi
+
+ok "Cache ready: $MODEL_PATH ($(du -sh "$MODEL_PATH" 2>/dev/null | cut -f1))"
 next_start_hint

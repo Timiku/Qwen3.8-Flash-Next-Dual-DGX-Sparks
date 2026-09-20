@@ -204,6 +204,10 @@ every measurement in this README.
 | `NFS_SERVER_IP` | *(unset → `IFACE` IPv4)* | *(unset → `10.0.22.1`)* | Head ConnectX address that exports the HF cache. Only used when `NFS_SHARE=true`. Do **not** use the `10.0.0.1` loopback alias |
 | `EXTRA_VLLM_ARGS` / `EXTRA_DOCKER_ARGS` | unset | unset | Escape hatches (`EXTRA_VLLM_ARGS` is appended last) |
 | `HF_TOKEN` | unset | unset | Required for `ABLIT=1` (gated Hugging Face repo). Environment wins over `.env` |
+| `CUDAGRAPH_CAPTURE_SIZES` | `auto` | `auto` | Decode CUDA graph widths; `auto` = every `(1+MTP)·S` for `S` in `1..MAX_NUM_SEQS` (vLLM's own list leaves full-batch widths graph-less → eager). Empty = vLLM default |
+| `CHAT_TEMPLATE` | unset | unset | Replacement Jinja template mounted into both nodes at `/root/chat_template.jinja`; also switches the tool parser to `qwen3_xml`. Empty = checkpoint template + `qwen3_coder` |
+| `MTP_K_SCHEDULE` | unset | unset | Per-batch-size speculative depth, `"start:end:K,..."`. Pin `VLLM_USE_V2_MODEL_RUNNER=1` (via `EXTRA_DOCKER_ARGS`) when set |
+| `READY_TIMEOUT_S` | `1200` | `1200` | Readiness budget before start.sh archives, removes the container, exits non-zero |
 
 > **KV cache dtype:** the default is now **`fp8`**, which needs `files/patch_qsa_fp8_kv.py` —
 > the stock QSA kernels declare `supported_kv_cache_dtypes = ["auto", "bfloat16"]` and raise

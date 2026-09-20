@@ -48,8 +48,27 @@ if [[ ! -f .env ]]; then
     exit 1
 fi
 
+
+# Knobs that are NOT read through an explicit _CLI_ variable above still have
+# to honour "environment > .env": sourcing .env would otherwise overwrite them.
+# Snapshot anything set in the environment, then restore it after the source
+# (same mechanism the single-Spark kit uses). Only the modern knobs are listed;
+# the pre-existing ones keep this kit's documented ".env beats the environment"
+# precedence.
+_ENV_SNAPSHOT_VARS=(CUDAGRAPH_MODE COMPILATION_MODE CUDAGRAPH_CAPTURE_SIZES
+                    MTP_K_SCHEDULE CHAT_TEMPLATE READY_TIMEOUT_S)
+for _v in "${_ENV_SNAPSHOT_VARS[@]}"; do
+    eval "_SNAP_$_v=\${$_v-}"
+    eval "_SNAPSET_$_v=\${$_v+set}"
+done
 # shellcheck source=.env
 source .env
+
+for _v in "${_ENV_SNAPSHOT_VARS[@]}"; do
+    if [[ -n "$(eval "printf %s \"\${_SNAPSET_$_v-}\"")" ]]; then
+        eval "$_v=\$_SNAP_$_v"
+    fi
+done
 
 [[ -n "$_CLI_ABLIT" ]] && ABLIT="$_CLI_ABLIT"
 ABLIT="${ABLIT:-0}"
@@ -152,6 +171,44 @@ fi
 QSA_PROFILE="${QSA_PROFILE:-stock}"
 # Refuse to launch when another process already holds the GPU (both nodes).
 REQUIRE_IDLE_GPU="${REQUIRE_IDLE_GPU:-true}"
+# torch.compile level. 0 = none (shipped). 3 = VLLM_COMPILE (Inductor fusion);
+# on this arch it loads and keeps FULL decode graphs but buys nothing
+# (+0.3%/+1.0%, inside noise; decode is bandwidth-bound) — measured on the
+# single-Spark kit, 2026-09-06.
+COMPILATION_MODE="${COMPILATION_MODE:-0}"
+CUDAGRAPH_MODE="${CUDAGRAPH_MODE:-FULL_DECODE_ONLY}"   # NONE for eager debug
+# CUDA graph capture sizes for decode. vLLM's default list is [1,2,4] plus
+# multiples of 8, each rounded up to a multiple of (1+MTP) and then filtered to
+# <= (1+MTP)*MAX_NUM_SEQS before it becomes a decode key. At MTP=3,
+# MAX_NUM_SEQS=8 that leaves keys {4,8,16}: a full 8-sequence verify batch is
+# 32 tokens, matches nothing, and decodes eager. "auto" captures every
+# (1+K(S))*S for S in 1..MAX_NUM_SEQS so every batch the scheduler can build
+# has a graph; a comma list sets them explicitly; empty keeps the vLLM default.
+# Capture costs ~1 s and a few MiB per size.
+CUDAGRAPH_CAPTURE_SIZES="${CUDAGRAPH_CAPTURE_SIZES:-}"
+# Batch-size schedule for the speculative token count, as
+# "start:end:K,start:end:K" over inclusive batch-size (num_seqs) ranges. Empty
+# keeps a constant MTP_NUM_SPECULATIVE_TOKENS at every batch size, which is
+# what the static sweeps say you want (K=3 optimal at every concurrency).
+# WARNING if you enable it: without a pinned V2 runner (EXTRA_DOCKER_ARGS
+# "-e VLLM_USE_V2_MODEL_RUNNER=1") vLLM overrides cudagraph_mode to PIECEWISE
+# from the draft model's config copy.
+MTP_K_SCHEDULE="${MTP_K_SCHEDULE:-}"
+# Replacement Jinja chat template (host path), mounted read-only into BOTH
+# nodes' containers at /root/chat_template.jinja. Empty keeps the checkpoint's
+# template + qwen3_coder. The shipped froggeric v22.5 template
+# (files/chat-template/froggeric-qwen-fixed.jinja) fixes the stock template's
+# raise_exception on reasoning_effort aliases, its crash on stringified-JSON
+# tool arguments, and the xhigh-by-default token burn; it emits canonical XML
+# tool calls, which pair with --tool-call-parser qwen3_xml (set automatically).
+CHAT_TEMPLATE="${CHAT_TEMPLATE:-}"
+if [[ -n "$CHAT_TEMPLATE" && "$CHAT_TEMPLATE" != /* ]]; then
+    CHAT_TEMPLATE="$SCRIPT_DIR/$CHAT_TEMPLATE"
+fi
+# Seconds the readiness loop waits for /health 200 before it archives the
+# container's log, removes it, and exits non-zero (the supervisor/backoff
+# relaunches). 20 min covers a cold JIT boot on both nodes.
+READY_TIMEOUT_S="${READY_TIMEOUT_S:-1200}"
 
 # YaRN only makes sense ABOVE the native 262144 context. At or below native,
 # rope scaling degrades quality for zero benefit — force it off.
@@ -619,6 +676,14 @@ elif $DO_LAUNCH && [[ "$MTP_NUM_SPECULATIVE_TOKENS" != "0" ]]; then
     warn "     to files/draft_vocab_en_code_47k.txt cuts that ~5x; see .env.sample."
 fi
 
+# Chat template: reuse the overlay machinery so the file lands at the same
+# container path on BOTH nodes (worker copies ride /tmp/vllm-overlay).
+if $DO_LAUNCH && [[ -n "$CHAT_TEMPLATE" ]]; then
+    info "=== Step 4e-2: chat template overlay ==="
+    add_overlay "$CHAT_TEMPLATE" "/root/chat_template.jinja"
+    ok "Chat template: $CHAT_TEMPLATE"
+fi
+
 # ---------------------------------------------------------------------------
 # 4e. FP8 KV cache. The stock QSA kernels hard-refuse anything but BF16 KV
 #     (supported_kv_cache_dtypes = ["auto","bfloat16"]); this teaches them to
@@ -794,6 +859,7 @@ if $DO_LAUNCH; then
     info "=== Step 7: Launch vLLM ==="
 
     VLLM_ARGS=()
+    VLLM_ARGS+=("--enable-prompt-tokens-details")
     VLLM_ARGS+=("--served-model-name" "$SERVED_MODEL_NAME")
     VLLM_ARGS+=("--tensor-parallel-size" "$TENSOR_PARALLEL_SIZE")
     VLLM_ARGS+=("--gpu-memory-utilization" "$GPU_MEMORY_UTILIZATION")
@@ -807,7 +873,15 @@ if $DO_LAUNCH; then
     VLLM_ARGS+=("--enable-chunked-prefill")
     VLLM_ARGS+=("--reasoning-parser" "qwen3")
     VLLM_ARGS+=("--enable-auto-tool-choice")
-    VLLM_ARGS+=("--tool-call-parser" "qwen3_coder")
+    if [[ -n "$CHAT_TEMPLATE" ]]; then
+        [[ -r "$CHAT_TEMPLATE" ]] || err "CHAT_TEMPLATE=$CHAT_TEMPLATE is not readable"
+        VLLM_ARGS+=("--chat-template" "/root/chat_template.jinja")
+        # The froggeric template emits canonical XML tool calls; qwen3_coder
+        # would not parse them.
+        VLLM_ARGS+=("--tool-call-parser" "qwen3_xml")
+    else
+        VLLM_ARGS+=("--tool-call-parser" "qwen3_coder")
+    fi
     VLLM_ARGS+=("--distributed-executor-backend" "mp")
     VLLM_ARGS+=("--mm-encoder-tp-mode" "$MM_ENCODER_TP_MODE")
     VLLM_ARGS+=("--nnodes" "2")
@@ -821,17 +895,62 @@ if $DO_LAUNCH; then
 
     # JSON args: use printf to build properly quoted strings for the heredoc
     if [[ "$MTP_NUM_SPECULATIVE_TOKENS" -gt 0 ]]; then
+        # --async-scheduling with MTP > 0 silently corrupts n-grams (jschmied:
+        # "no benchmark reveals it"). Match the bare flag after the word-split
+        # and any "--async-scheduling=..." value.
+        if [[ "$EXTRA_VLLM_ARGS" == *"--async-scheduling"* ]]; then
+            err "EXTRA_VLLM_ARGS contains --async-scheduling while MTP is on: silent n-gram corruption (jschmied). Remove --async-scheduling."
+        fi
+        _SPEC_ARGMAX=""
+        _SPEC_SCHED=""
         if [[ -n "$MTP_DRAFT_VOCAB" ]]; then
             # get_top_tokens (added by patch_mtp_draft_vocab.py) is only reached
             # through this flag; it also cuts the draft all-gather from
             # O(vocab_size) to O(2*tp_size) per token.
-            VLLM_ARGS+=("--speculative-config" "$(printf "'{\"method\":\"mtp\",\"num_speculative_tokens\":%s,\"use_local_argmax_reduction\":true}'" "$MTP_NUM_SPECULATIVE_TOKENS")")
-        else
-            VLLM_ARGS+=("--speculative-config" "$(printf "'{\"method\":\"mtp\",\"num_speculative_tokens\":%s}'" "$MTP_NUM_SPECULATIVE_TOKENS")")
+            _SPEC_ARGMAX=',"use_local_argmax_reduction":true'
         fi
+        if [[ -n "$MTP_K_SCHEDULE" ]]; then
+            _SPEC_SCHED=",\"num_speculative_tokens_per_batch_size\":[$(
+                printf '%s' "$MTP_K_SCHEDULE" | awk -F, '{
+                    out=""
+                    for (i = 1; i <= NF; i++) {
+                        split($i, r, ":")
+                        out = out (i > 1 ? "," : "") "[" r[1] "," r[2] "," r[3] "]"
+                    }
+                    printf "%s", out
+                }')]"
+        fi
+        VLLM_ARGS+=("--speculative-config" "$(printf "'{\"method\":\"mtp\",\"num_speculative_tokens\":%s%s%s}'" "$MTP_NUM_SPECULATIVE_TOKENS" "$_SPEC_SCHED" "$_SPEC_ARGMAX")")
     fi
 
-    VLLM_ARGS+=("--compilation-config" "$(printf "'{\"mode\":0,\"cudagraph_mode\":\"FULL_DECODE_ONLY\"}'")")
+    # CUDA graph capture sizes: "auto" derives every (1+K(S))*S width the
+    # scheduler can build for S in 1..MAX_NUM_SEQS (same expression as the
+    # single-Spark kit); a comma list passes through; empty keeps vLLM's default.
+    _CG_SIZES="$CUDAGRAPH_CAPTURE_SIZES"
+    if [[ "$_CG_SIZES" == "auto" ]]; then
+        _CG_SIZES=$(
+            _AUTO_MAX_SEQS="$MAX_NUM_SEQS" \
+            _AUTO_K="$MTP_NUM_SPECULATIVE_TOKENS" \
+            _AUTO_SCHED="$MTP_K_SCHEDULE" \
+            python3 -c '
+import os
+max_seqs = int(os.environ["_AUTO_MAX_SEQS"])
+k_default = int(os.environ["_AUTO_K"])
+k_of = {}
+for part in filter(None, os.environ["_AUTO_SCHED"].strip().split(",")):
+    lo, hi, k = (int(x) for x in part.split(":"))
+    for s in range(lo, min(hi, max_seqs) + 1):
+        k_of.setdefault(s, min(k, k_default))
+print(",".join(str(x) for x in sorted(
+    {(1 + k_of.get(s, k_default)) * s for s in range(1, max_seqs + 1)})))
+'
+        )
+    fi
+    if [[ -n "$_CG_SIZES" ]]; then
+        VLLM_ARGS+=("--compilation-config" "$(printf "'{\"mode\":%s,\"cudagraph_mode\":\"%s\",\"cudagraph_capture_sizes\":[%s]}'" "$COMPILATION_MODE" "$CUDAGRAPH_MODE" "$_CG_SIZES")")
+    else
+        VLLM_ARGS+=("--compilation-config" "$(printf "'{\"mode\":%s,\"cudagraph_mode\":\"%s\"}'" "$COMPILATION_MODE" "$CUDAGRAPH_MODE")")
+    fi
 
     # hf-overrides: ONE merged payload, nested under "text_config".
     # vLLM's ModelConfig._apply_dict_overrides only recurses into keys that are
@@ -1054,6 +1173,19 @@ LAUNCH_EOF
 
     # ---- Head (rank 0) ----
     info "--- Launching head (rank 0) on $HEAD_IP ---"
+    ARCHIVE_TS=$(date '+%Y%m%dT%H%M%S')
+    mkdir -p "$SCRIPT_DIR/logs/archive"
+    # Keep the newest 20 sets, then drop the oldest (same rule as the single kit):
+    # a set is a timestamp prefix with -container.log / -memwatch.log /
+    # -timeout.log members.
+    ls -1t "$SCRIPT_DIR"/logs/archive/*-container.log 2>/dev/null | tail -n +21 | while read -r f; do
+        _set="${f%-container.log}"
+        rm -f "${_set}-container.log" "${_set}-memwatch.log" "${_set}-timeout.log" 2>/dev/null || true
+    done
+    if docker inspect vllm-fn &>/dev/null; then
+        docker logs --tail 3000 vllm-fn > "$SCRIPT_DIR/logs/archive/vllm-fn-${ARCHIVE_TS}-container.log" 2>&1 || true
+        info "Previous container log archived: logs/archive/vllm-fn-${ARCHIVE_TS}-container.log"
+    fi
     docker rm -f vllm-fn >/dev/null 2>&1 || true
     mkdir -p "$HOME/.cache/vllm"
 
@@ -1104,6 +1236,21 @@ LAUNCH_EOF
     bash "$HEAD_SCRIPT"
     rm -f "$HEAD_SCRIPT"
     ok "Head container started."
+
+    # Host-memory watchdog (ported from the single-Spark kit): on unified
+    # memory an exhausted pool hangs the kernel instead of raising an OOM, so
+    # a poller stops the container when the host runs out of margin. Same
+    # helper the supervisor calls, so the invocation cannot drift.
+    mkdir -p "$SCRIPT_DIR/logs/archive"
+    MEMWATCH_LOG="$SCRIPT_DIR/logs/memwatch-vllm-fn.log"
+    if [[ -s "$MEMWATCH_LOG" ]]; then
+        mv "$MEMWATCH_LOG" "$SCRIPT_DIR/logs/archive/vllm-fn-${ARCHIVE_TS}-memwatch.log" 2>/dev/null || true
+    fi
+    MEMWATCH_MIN_FREE_GIB="${MEMWATCH_MIN_FREE_GIB:-2}" \
+    MEMWATCH_FREE_GATE_GIB="${MEMWATCH_FREE_GATE_GIB:-10}" \
+    MEMWATCH_GRACE="${MEMWATCH_GRACE:-30}" MEMWATCH_LOG="$MEMWATCH_LOG" \
+        bash "$SCRIPT_DIR/scripts/start-memwatch.sh" vllm-fn "${MEMWATCH_MIN_GIB:-6}" >/dev/null
+    ok "Watchdog running (stops the container when host margin collapses): logs/memwatch-vllm-fn.log"
     info ""
     info "vLLM is loading (~6-7 min). Following logs until ready..."
     info ""
@@ -1112,12 +1259,30 @@ LAUNCH_EOF
     docker logs -f vllm-fn &
     LOGPID=$!
 
-    info "Waiting for /health to return 200..."
+    info "Waiting for /health to return 200 (timeout ${READY_TIMEOUT_S}s)..."
+    WAIT_START=$(date +%s)
+    _last_hb=0
     while true; do
         sleep 10
+        NOW=$(date +%s)
+        ELAPSED=$((NOW - WAIT_START))
+        if [[ "$ELAPSED" -gt "$READY_TIMEOUT_S" ]]; then
+            kill $LOGPID 2>/dev/null || true
+            echo ""
+            err "Readiness timed out after ${ELAPSED}s (>READY_TIMEOUT_S=${READY_TIMEOUT_S})."
+            err "Container was wedged before /health; archiving, removing, and exiting non-zero."
+            docker logs vllm-fn > "$SCRIPT_DIR/logs/archive/vllm-fn-${ARCHIVE_TS}-timeout.log" 2>&1 || true
+            docker rm -f vllm-fn >/dev/null 2>&1 || true
+            exit 1
+        fi
         # Check if container is still running
         if ! docker ps --format '{{.Names}}' | grep -q '^vllm-fn$'; then
             kill $LOGPID 2>/dev/null || true
+            echo ""
+            REASON=$(docker logs vllm-fn 2>&1 \
+                     | grep -oE "(ValueError|RuntimeError|TimeoutError|torch\.[A-Za-z]*Error): .*" \
+                     | grep -viE "min_frames|max_frames" | tail -1 | cut -c1-400)
+            [[ -n "$REASON" ]] && { echo "  vLLM reported:"; echo "    $REASON"; }
             err "Container vllm-fn exited unexpectedly. Check: docker logs vllm-fn"
         fi
         # Check health endpoint
@@ -1125,7 +1290,15 @@ LAUNCH_EOF
         if [[ "$HTTP_CODE" == "200" ]]; then
             kill $LOGPID 2>/dev/null || true
             echo ""
-            ok "vLLM is ready and serving on port $PORT!"
+            ok "vLLM is ready and serving on port $PORT (after ${ELAPSED}s)!"
+            docker logs vllm-fn 2>&1 | grep -iE "GPU KV cache size|Available KV cache|Maximum concurrency" | tail -3 || true
+            # Resuming after a manual stop clears the manual stopping flag: the
+            # operator's own relaunch IS the resume (stop.sh's header promise).
+            # A non-manual flag belongs to a maintenance window — leave it.
+            if [[ -f "$SCRIPT_DIR/logs/stopping" && "$(head -n 1 "$SCRIPT_DIR/logs/stopping" 2>/dev/null)" == "manual" ]]; then
+                rm -f "$SCRIPT_DIR/logs/stopping"
+                info "manual stop flag cleared — supervisor resumes full supervision."
+            fi
             info ""
             info "Test with:"
             info "  curl http://localhost:$PORT/v1/chat/completions \\"
@@ -1135,6 +1308,10 @@ LAUNCH_EOF
             info "View logs: docker logs -f vllm-fn"
             info "Stop:      ./stop.sh"
             break
+        fi
+        if (( NOW - _last_hb >= 60 )); then
+            _last_hb=$NOW
+            echo "  ...waiting for readiness: ${ELAPSED}s elapsed, last /health code $HTTP_CODE"
         fi
     done
 fi

@@ -2,6 +2,47 @@
 
 Notable changes to this deployment. Format follows [Keep a Changelog](https://keepachangelog.com/1.1.0/).
 
+## 2026-09-19
+
+### Added — improvements ported from MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark
+
+- **Decode CUDA graph coverage** (`CUDAGRAPH_CAPTURE_SIZES=auto`, on by
+  default): captures every `(1+MTP)·S` width for `S` in `1..MAX_NUM_SEQS`.
+  vLLM's stock list leaves full-batch verify widths without a graph (eager
+  decode at the highest concurrency the scheduler builds).
+- **`MTP_K_SCHEDULE`** — per-batch-size speculative depth (needs the
+  `VLLM_USE_V2_MODEL_RUNNER=1` pin; documented in `.env.sample`), plus the
+  `--async-scheduling` + MTP silent-corruption guard.
+- **`CHAT_TEMPLATE`** — host template mounted into both nodes via the overlay
+  machinery at `/root/chat_template.jinja`, tool parser auto-switches to
+  `qwen3_xml`. Ships froggeric's v22.5 fixed template; render-verified in the
+  pinned image (plain, tools-XML, `reasoning_effort` aliases).
+- **`--enable-prompt-tokens-details`** — per-request cached-token usage now
+  reported (`usage.prompt_tokens_details`).
+- **download.sh: sha256 verification of LFS blobs** (`VERIFY_SHA256`, default
+  on): paginated HF tree-manifest walk + per-blob hash with a resume state
+  file; a complete cache re-verifies on rerun. Catches preallocated-but-corrupt
+  blobs that size checks miss.
+- **Byte-pinned draft vocabularies** — `build_draft_vocab.py` pins all 256
+  byte-level fallback ids; the shipped `draft_vocab_en_code_47k.txt` carries
+  the 23 of them English frequency alone did not keep. Spanish variant
+  (`draft_vocab_es_en_code_65k.txt`) and `build_draft_vocab_extend.py` ship too.
+- **24/7 supervision** (`scripts/supervise.sh` + systemd user units,
+  `health-probe.sh`, `heartbeat.sh`, `maintenance-relaunch.sh`,
+  `memwatch-rotate.sh`, `alert.sh`): state-machine restart, circuit breaker,
+  manual-stop flag, daily heartbeat. Install steps in each unit header.
+- **Host-memory watchdog** (`files/memwatch.sh` v2: dual trigger — sustained
+  `MemAvailable` floor + `MemFree` gate — grace window, `docker stop` before
+  `kill`), started by `start.sh` on every launch.
+- **Readiness hardening** in `start.sh`: `READY_TIMEOUT_S` (archive → remove →
+  exit 1), first-error extraction from container logs on early exit, 60 s
+  heartbeat while waiting, KV-pool summary lines on ready. `stop.sh`: graceful
+  `docker stop -t STOP_TIMEOUT` before `rm -f` (validated integer), `--force`,
+  log archive + prune, `/dev/shm` segment report.
+- **`.env` precedence fix** in `start.sh`: new knobs honour
+  environment-beats-`.env` via an env snapshot around `source .env`.
+- `tests/test_prompt_token_details.py` — CPU-only argv-shape check for the
+  new launcher flags.
 ## 2026-09-16
 
 ### Added

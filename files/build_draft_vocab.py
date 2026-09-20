@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MiaAI Lab (https://x.com/MiaAI_lab)
-# Vendored from MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark; default model id
-# repointed at this deployment's checkpoint.
 """Build the reduced draft vocabulary for files/patch_mtp_draft_vocab.py.
 
 Counts token frequencies over a corpus and writes the most frequent ids, one
@@ -13,9 +11,11 @@ and not the prompts.
   python3 files/build_draft_vocab.py corpus.jsonl --out draft_vocab.txt --size 32768
 
 Reads .jsonl with a "text" field, or plain .txt. Always keeps every special /
-added token, whatever its frequency: those are cheap (a few hundred rows) and
-losing one costs acceptance at exactly the structural boundaries where drafts
-are otherwise easiest.
+added token AND every byte-level token, whatever their frequency: those are
+cheap (a few hundred rows) and losing one costs acceptance at exactly the
+structural boundaries where drafts are otherwise easiest. Byte-level tokens
+matter most for non-English text -- they are what BPE falls back to for
+multi-byte UTF-8 -- and frequency alone will not keep them on a small corpus.
 
 Coverage, not size, is the number to tune on. Report prints the fraction of
 corpus token occurrences the chosen vocabulary covers; the tokens it misses
@@ -64,19 +64,6 @@ def main() -> None:
     ap.add_argument("--out", default="draft_vocab.txt")
     ap.add_argument("--size", type=int, default=32768)
     ap.add_argument("--report-only", action="store_true")
-    ap.add_argument("--balance-shards", type=int, default=1,
-                    help="spread the --fill-to-size padding evenly over this many "
-                         "equal vocabulary ranges (set it to your tensor-parallel "
-                         "size). A vocab-parallel lm_head splits by id range, and a "
-                         "decode step waits for the slowest rank, so an unbalanced "
-                         "draft vocabulary saves bandwidth on one rank and none on "
-                         "the other. Corpus-ranked ids are never dropped to balance.")
-    ap.add_argument("--fill-to-size", action="store_true",
-                    help="if the corpus yields fewer distinct ids than --size, pad up "
-                         "to --size with the lowest-numbered unseen ids. Byte-level BPE "
-                         "vocabularies are built in merge order, so low ids are the "
-                         "frequent merges -- a proxy, not a measurement. Use it when the "
-                         "corpus is too small to rank that far, and say so in the docs.")
     args = ap.parse_args()
 
     from transformers import AutoTokenizer
@@ -102,6 +89,30 @@ def main() -> None:
     special = set(tok.all_special_ids or [])
     added = getattr(tok, "added_tokens_encoder", {}) or {}
     special |= {int(i) for i in added.values()}
+
+    # Byte-level tokens are pinned for the same reason as special tokens, and
+    # the reason is sharper: they are the pieces BPE falls back to for anything
+    # the merges do not cover, which on this tokenizer means every multi-byte
+    # UTF-8 sequence -- accented Latin, CJK, emoji. They are ~256 rows, so
+    # keeping them is free.
+    #
+    # Frequency alone does NOT keep them. A corpus large and varied enough
+    # exercises them often enough to rank; a smaller or narrower one does not,
+    # and then they are silently dropped. Measured on this checkpoint: a build
+    # over 513 MiB of wikitext keeps 376 ids below 400, while one over 11.7 MB
+    # of conversation logs keeps 286 -- 90 fewer, and the missing ones are what
+    # assemble "n-tilde" and the accents. The resulting drafter proposes badly
+    # at exactly those boundaries.
+    byte_level = set()
+    for tid in range(min(512, vocab_size)):
+        piece = tok.convert_ids_to_tokens(tid)
+        if not isinstance(piece, str):
+            continue
+        # "<0xNN>" style, or a single char from the byte-level alphabet
+        if (piece.startswith("<0x") and piece.endswith(">")) or len(piece) == 1:
+            byte_level.add(tid)
+    special |= byte_level
+
     special = {i for i in special if 0 <= i < vocab_size}
 
     ranked = [tid for tid, _ in counts.most_common()]
@@ -113,40 +124,6 @@ def main() -> None:
         if tid not in seen:
             keep.append(tid)
             seen.add(tid)
-    if args.fill_to_size and len(keep) < args.size:
-        before = len(keep)
-        nshards = max(1, args.balance_shards)
-        width = -(-vocab_size // nshards)          # ceil, matching an even id split
-        # Per-shard candidate pools, lowest id first (BPE merge order = frequency proxy).
-        pools = [
-            [t for t in range(sh * width, min((sh + 1) * width, vocab_size))
-             if t not in seen]
-            for sh in range(nshards)
-        ]
-        # Round-robin, but aim at an equal FINAL count per shard, since the corpus
-        # ids are themselves unevenly spread.
-        have = [sum(1 for t in keep if sh * width <= t < (sh + 1) * width)
-                for sh in range(nshards)]
-        cursor = [0] * nshards
-        while len(keep) < args.size:
-            sh = min(range(nshards), key=lambda i: have[i])
-            if cursor[sh] >= len(pools[sh]):
-                have[sh] = float("inf")            # this shard is exhausted
-                if all(h == float("inf") for h in have):
-                    break
-                continue
-            tid = pools[sh][cursor[sh]]
-            cursor[sh] += 1
-            keep.append(tid)
-            seen.add(tid)
-            have[sh] += 1
-        final = [sum(1 for t in seen if sh * width <= t < (sh + 1) * width)
-                 for sh in range(nshards)]
-        print(f"fill:        {before:,} corpus-ranked ids padded to {len(keep):,} "
-              f"with unseen ids (BPE merge-order proxy)")
-        if nshards > 1:
-            print(f"balance:     per-shard counts {final} over {nshards} ranges "
-                  f"of {width:,} ids")
     keep = sorted(seen)
 
     covered = sum(counts[t] for t in seen if t in counts)
@@ -154,7 +131,7 @@ def main() -> None:
           f"{len(counts):,} distinct ids")
     print(f"vocabulary:  {vocab_size:,} -> {len(keep):,} "
           f"({100.0 * len(keep) / vocab_size:.1f}%), "
-          f"{len(special)} special/added kept unconditionally")
+          f"{len(special)} pinned unconditionally ({len(byte_level)} byte-level)")
     print(f"coverage:    {100.0 * covered / total:.4f}% of corpus occurrences")
     miss = total - covered
     print(f"             {miss:,} occurrences ({100.0 * miss / total:.4f}%) fall "
