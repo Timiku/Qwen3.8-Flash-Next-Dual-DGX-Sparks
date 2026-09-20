@@ -460,7 +460,10 @@ class PleOffloadRunner:
                 if not (
                     layer_name in packed_tables
                     and param_name
-                    in ("ngram_embedding.weight", "ngram_embedding.weight_scale")
+                    in (("ngram_embedding.weight", "ngram_embedding.weight_scale")
+                        if getattr(layer.ngram_embedding.quant_method,
+                                   "packed_row_width", None) is not None
+                        else ("ngram_embedding.weight",))
                 )
             }
             loaded_offload_entries = {
@@ -512,6 +515,14 @@ class PleOffloadRunner:
         emb = layer.ngram_embedding
         quant_method = getattr(emb, "quant_method", None)
         expected_width = getattr(quant_method, "packed_row_width", None)
+        if expected_width is None:
+            if emb.weight.dtype != torch.float8_e4m3fn:
+                raise RuntimeError(f"PLE {name}: unsupported packed dtype {emb.weight.dtype}")
+            expected_width = emb.weight.shape[-1]
+            if meta.get("shard_dtype") != "F8_E4M3" or meta.get("scales_width") != 0:
+                raise RuntimeError(f"PLE {name}: FP8 packed metadata mismatch")
+        elif meta.get("shard_dtype", "U8") != "U8":
+            raise RuntimeError(f"PLE {name}: NVFP4 packed metadata mismatch")
         if expected_width is not None and expected_width != width:
             raise RuntimeError(
                 f"PLE {name}: packed table row width {width} != "
@@ -525,17 +536,31 @@ class PleOffloadRunner:
         if os.path.getsize(path) != rows * width:
             raise RuntimeError(f"PLE {name}: packed table size mismatch")
         mm = np.memmap(path, dtype=np.uint8, mode="r", shape=(rows, width))
+        # 27 GiB of randomly-accessed rows against a far smaller page
+        # cache. Default mmap behaviour faults in a ~64 KiB window per
+        # touched row (fault-around); nearly all of it is never read.
+        # Declaring the access random makes each fault cost one page.
+        try:
+            import mmap as _mmap_mod
+            mm._mmap.madvise(_mmap_mod.MADV_RANDOM)
+            _advice = "MADV_RANDOM"
+        except Exception as _exc:  # advisory only, never fatal
+            _advice = f"no madvise ({_exc})"
         table = torch.from_numpy(mm)  # zero-copy, file-backed, evictable
         emb._packed_table = table
         emb._packed_table_mmap = mm
+        # Same file, opened for posix_fadvise(WILLNEED): the gather in
+        # ple_layer batches its page reads through this fd so the NVMe
+        # sees them together instead of one fault at a time.
+        emb._packed_table_fd = os.open(path, os.O_RDONLY)
         # Release the never-touched anonymous allocations.
         emb.weight.data = torch.empty(0, dtype=emb.weight.dtype)
         ws = getattr(emb, "weight_scale", None)
         if ws is not None and ws.dim() == 2:
             ws.data = torch.empty(0, dtype=ws.dtype)
         logger.info(
-            "PLE %s: mmap table attached (%d rows x %d B = %.2f GiB)",
-            name, rows, width, rows * width / 2**30,
+            "PLE %s: mmap table attached (%d rows x %d B = %.2f GiB) [%s]",
+            name, rows, width, rows * width / 2**30, _advice,
         )
 
     def accept_registrations(
@@ -564,9 +589,14 @@ class PleOffloadRunner:
 
         dp_size = self.vllm_config.parallel_config.data_parallel_size
         tp_size = self.vllm_config.parallel_config.tensor_parallel_size
-        if num_workers != dp_size * tp_size:
+        local_workers = max(
+            1,
+            (dp_size * tp_size)
+            // max(self.vllm_config.parallel_config.nnodes, 1),
+        )
+        if num_workers != local_workers:
             raise RuntimeError(
-                f"Expected {dp_size * tp_size} registrations for DP={dp_size}, "
+                f"Expected {local_workers} registrations for DP={dp_size}, "
                 f"TP={tp_size}, got {num_workers}"
             )
 
@@ -575,14 +605,16 @@ class PleOffloadRunner:
             registrations_by_dp.setdefault(registration.dp_rank, []).append(
                 registration
             )
-        if set(registrations_by_dp) != set(range(dp_size)):
+        if not registrations_by_dp or not (
+            set(registrations_by_dp) <= set(range(dp_size))
+        ):
             raise RuntimeError(
                 f"Expected DP ranks {set(range(dp_size))}, "
                 f"got {set(registrations_by_dp)}"
             )
         for dp_rank, dp_registrations in registrations_by_dp.items():
             tp_ranks = {registration.tp_rank for registration in dp_registrations}
-            if tp_ranks != set(range(tp_size)):
+            if not tp_ranks or not tp_ranks <= set(range(tp_size)):
                 raise RuntimeError(
                     f"DP rank {dp_rank} expected TP ranks {set(range(tp_size))}, "
                     f"got {tp_ranks}"
@@ -609,14 +641,17 @@ class PleOffloadRunner:
                 targets_for_dp.setdefault(layer_name, []).append(target)
             # All TP ranks in one DP group receive the same input, so buffers
             # registered by TP rank zero are sufficient for that DP rank.
-            if registration.tp_rank == 0:
+            if (
+                registration.tp_rank == 0
+                or registration.dp_rank not in self._input_bufs
+            ):
                 self._input_bufs[registration.dp_rank] = PleOffloadInputBuffers(
                     input_ids_buf=registration.input_ids_buf,
                     query_start_loc_buf=registration.query_start_loc_buf,
                     ngram_context_buf=registration.ngram_context_buf,
                 )
 
-        if set(self._input_bufs) != set(range(dp_size)):
+        if set(self._input_bufs) != set(registrations_by_dp):
             raise RuntimeError(
                 "TP rank zero did not register PLE input buffers for every DP "
                 f"rank: expected={set(range(dp_size))}, got={set(self._input_bufs)}"
@@ -628,10 +663,10 @@ class PleOffloadRunner:
         for dp_rank, layer_targets in self._worker_targets.items():
             self._pinned_bufs[dp_rank] = {}
             for layer_name, targets in layer_targets.items():
-                if len(targets) != tp_size:
+                if not targets or len(targets) > tp_size:
                     raise RuntimeError(
                         f"PLE layer {layer_name} for DP rank {dp_rank} received "
-                        f"{len(targets)} targets, expected {tp_size}"
+                        f"{len(targets)} targets, expected 1..{tp_size}"
                     )
                 targets.sort(key=lambda target: target.tp_rank)
                 self._pinned_bufs[dp_rank][layer_name] = torch.empty(

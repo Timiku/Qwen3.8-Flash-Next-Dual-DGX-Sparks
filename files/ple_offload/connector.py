@@ -58,6 +58,15 @@ class PleOffloadConnector:
         self.device = device
         self.dp_rank = get_dp_group().rank_in_group
         self.tp_rank = get_tp_group().rank_in_group
+        _pc = vllm_config.parallel_config
+        # Node-local leader: the rank that talks to THIS node's
+        # PleOffloadWorker. On a single node that is exactly TP0;
+        # with TP spread over nnodes it is every rank that heads a
+        # node (global rank % ranks-per-node == 0).
+        self._node_leader = self.tp_rank == 0 or (
+            _pc.nnodes > 1
+            and _pc.rank % max(1, _pc.world_size // max(_pc.nnodes, 1)) == 0
+        )
         self._layers = self._setup_layers(vllm_config, model)
 
         # Both runner paths stage into the same shared buffers. TP0 registers
@@ -121,7 +130,7 @@ class PleOffloadConnector:
             self._registration_socket.connect(ipc_addr)
             self._register_with_offload_worker(vllm_config, ipc_addr)
 
-            if self.tp_rank == 0:
+            if self._node_leader:
                 # ForkingPickler may replace CPU storage while converting its
                 # sharing strategy, so register only the final addresses.
                 with torch.accelerator.device_index(self.device.index):
@@ -390,7 +399,7 @@ class PleOffloadConnector:
         # rank then blocks until its own output buffer is complete.
         self._seq += 1
         seq = self._seq
-        if self.tp_rank == 0:
+        if self._node_leader:
             if self._uses_cuda_inputs:
                 assert self._input_ready_event is not None
                 # The D2H stream waits for runner input production (and for

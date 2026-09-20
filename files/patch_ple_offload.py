@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MiaAI Lab (https://x.com/MiaAI_lab)
 """Patch vLLM's PLE CPU-offload machinery so it works on DGX Spark (GB10).
 
 Why this exists (measured on this box, see docs/HANDOFF-single-spark.md):
@@ -319,7 +321,10 @@ patch("worker.py", [
         "                if not (\n"
         "                    layer_name in packed_tables\n"
         "                    and param_name\n"
-        "                    in (\"ngram_embedding.weight\", \"ngram_embedding.weight_scale\")\n"
+        "                    in ((\"ngram_embedding.weight\", \"ngram_embedding.weight_scale\")\n"
+        "                        if getattr(layer.ngram_embedding.quant_method,\n"
+        "                                   \"packed_row_width\", None) is not None\n"
+        "                        else (\"ngram_embedding.weight\",))\n"
         "                )\n"
         "            }\n",
     ),
@@ -343,6 +348,14 @@ patch("worker.py", [
         "        emb = layer.ngram_embedding\n"
         "        quant_method = getattr(emb, \"quant_method\", None)\n"
         "        expected_width = getattr(quant_method, \"packed_row_width\", None)\n"
+        "        if expected_width is None:\n"
+        "            if emb.weight.dtype != torch.float8_e4m3fn:\n"
+        "                raise RuntimeError(f\"PLE {name}: unsupported packed dtype {emb.weight.dtype}\")\n"
+        "            expected_width = emb.weight.shape[-1]\n"
+        "            if meta.get(\"shard_dtype\") != \"F8_E4M3\" or meta.get(\"scales_width\") != 0:\n"
+        "                raise RuntimeError(f\"PLE {name}: FP8 packed metadata mismatch\")\n"
+        "        elif meta.get(\"shard_dtype\", \"U8\") != \"U8\":\n"
+        "            raise RuntimeError(f\"PLE {name}: NVFP4 packed metadata mismatch\")\n"
         "        if expected_width is not None and expected_width != width:\n"
         "            raise RuntimeError(\n"
         "                f\"PLE {name}: packed table row width {width} != \"\n"
@@ -356,17 +369,31 @@ patch("worker.py", [
         "        if os.path.getsize(path) != rows * width:\n"
         "            raise RuntimeError(f\"PLE {name}: packed table size mismatch\")\n"
         "        mm = np.memmap(path, dtype=np.uint8, mode=\"r\", shape=(rows, width))\n"
+        "        # 27 GiB of randomly-accessed rows against a far smaller page\n"
+        "        # cache. Default mmap behaviour faults in a ~64 KiB window per\n"
+        "        # touched row (fault-around); nearly all of it is never read.\n"
+        "        # Declaring the access random makes each fault cost one page.\n"
+        "        try:\n"
+        "            import mmap as _mmap_mod\n"
+        "            mm._mmap.madvise(_mmap_mod.MADV_RANDOM)\n"
+        "            _advice = \"MADV_RANDOM\"\n"
+        "        except Exception as _exc:  # advisory only, never fatal\n"
+        "            _advice = f\"no madvise ({_exc})\"\n"
         "        table = torch.from_numpy(mm)  # zero-copy, file-backed, evictable\n"
         "        emb._packed_table = table\n"
         "        emb._packed_table_mmap = mm\n"
+        "        # Same file, opened for posix_fadvise(WILLNEED): the gather in\n"
+        "        # ple_layer batches its page reads through this fd so the NVMe\n"
+        "        # sees them together instead of one fault at a time.\n"
+        "        emb._packed_table_fd = os.open(path, os.O_RDONLY)\n"
         "        # Release the never-touched anonymous allocations.\n"
         "        emb.weight.data = torch.empty(0, dtype=emb.weight.dtype)\n"
         "        ws = getattr(emb, \"weight_scale\", None)\n"
         "        if ws is not None and ws.dim() == 2:\n"
         "            ws.data = torch.empty(0, dtype=ws.dtype)\n"
         "        logger.info(\n"
-        "            \"PLE %s: mmap table attached (%d rows x %d B = %.2f GiB)\",\n"
-        "            name, rows, width, rows * width / 2**30,\n"
+        "            \"PLE %s: mmap table attached (%d rows x %d B = %.2f GiB) [%s]\",\n"
+        "            name, rows, width, rows * width / 2**30, _advice,\n"
         "        )\n"
         "\n"
         "    def accept_registrations(\n",
@@ -411,6 +438,169 @@ patch("worker.py", [
         "                        flags.append(target.done_flag)\n"
         "            for flag in flags:\n"
         "                flag[0] = request.seq\n",
+    ),
+])
+
+# --------------------------------------------------------------------------
+# Multi-node (dual-Spark, TP2 with one rank per node): the offload process is
+# spawned once PER NODE and each GPU worker registers with the offload worker
+# that shares its node. The design rides on three stock facts:
+#   * _ple_offload_ipc_path = get_open_zmq_ipc_path() -> a per-process uuid,
+#     so each node's bind/connect pair is unique even when both nodes spawn;
+#   * the registration pickles CUDA-IPC + /dev/shm handles, which only work
+#     process-to-process on the SAME node — per-node pairing is the only
+#     correct topology, and it mirrors the CPU-pool placement (#39);
+#   * the table file is read by the offload process alone, so the file must
+#     be present on every node (start.sh pushes it to the worker).
+# Stock blocks this shape at validation (nnodes must be 1). The validation
+# relaxation lives in the connector (import-time patch of the stock gate);
+# spawn/wait ride on the gpu_worker overlay.
+# --------------------------------------------------------------------------
+patch("gpu_worker.py", [
+    # Multi-node relaxation. Stock refuses nnodes>1 because the offload
+    # process is spawned once (global rank 0) and registrations travel over
+    # a NODE-LOCAL zmq ipc socket: with TP ranks on both nodes, the worker
+    # node's rank would wait forever. Per-node spawn fixes the topology:
+    # every node runs one PleOffloadWorker serving its local ranks, and the
+    # table file is present on every node (start.sh syncs it). Single-node
+    # behaviour is bit-for-bit unchanged by every formula below.
+    (
+        "        unsupported = []\n"
+        "        if parallel_config.nnodes != 1:\n"
+        "            unsupported.append(f\"nnodes={parallel_config.nnodes}\")\n",
+        "        unsupported = []\n",
+    ),
+    (
+        "        if (\n"
+        "            not self._ple_offload_enabled\n"
+        "            or self.rank != 0\n"
+        "            or self.parallel_config.data_parallel_rank != 0\n"
+        "        ):\n"
+        "            return\n",
+        "        if (\n"
+        "            not self._ple_offload_enabled\n"
+        "            or self.parallel_config.data_parallel_rank != 0\n"
+        "            or self.local_rank != 0\n"
+        "            or self.rank\n"
+        "            % max(\n"
+        "                1,\n"
+        "                self.parallel_config.world_size\n"
+        "                // max(self.parallel_config.nnodes, 1),\n"
+        "            )\n"
+        "            != 0\n"
+        "        ):\n"
+        "            return\n",
+    ),
+    (
+        "        num_workers = dp_size * tp_size\n",
+        "        num_workers = max(\n"
+        "            1, (dp_size * tp_size) // max(self.parallel_config.nnodes, 1)\n"
+        "        )\n",
+    ),
+])
+
+
+def amend(name: str, edits: list[tuple[str, str]]) -> None:
+    """Apply edits to the already-patched output (multi-node refinements)."""
+    path = os.path.join(OUT, name)
+    src = open(path).read()
+    for old, new in edits:
+        count = src.count(old)
+        if count != 1:
+            raise SystemExit(
+                f"{name}: amend anchor not unique/missing (count={count}):\n{old[:300]}"
+            )
+        src = src.replace(old, new)
+    open(path, "w").write(src)
+    print(f"amended {name}")
+
+
+amend("connector.py", [
+    (
+        "        self.tp_rank = get_tp_group().rank_in_group\n",
+        "        self.tp_rank = get_tp_group().rank_in_group\n"
+        "        _pc = vllm_config.parallel_config\n"
+        "        # Node-local leader: the rank that talks to THIS node's\n"
+        "        # PleOffloadWorker. On a single node that is exactly TP0;\n"
+        "        # with TP spread over nnodes it is every rank that heads a\n"
+        "        # node (global rank % ranks-per-node == 0).\n"
+        "        self._node_leader = self.tp_rank == 0 or (\n"
+        "            _pc.nnodes > 1\n"
+        "            and _pc.rank % max(1, _pc.world_size // max(_pc.nnodes, 1)) == 0\n"
+        "        )\n",
+    ),
+    (
+        "            if self.tp_rank == 0:\n"
+        "                # ForkingPickler may replace CPU storage while converting its\n",
+        "            if self._node_leader:\n"
+        "                # ForkingPickler may replace CPU storage while converting its\n",
+    ),
+    (
+        "        self._seq += 1\n"
+        "        seq = self._seq\n"
+        "        if self.tp_rank == 0:\n",
+        "        self._seq += 1\n"
+        "        seq = self._seq\n"
+        "        if self._node_leader:\n",
+    ),
+])
+
+amend("worker.py", [
+    # One registration set per node, not per world.
+    (
+        "        if num_workers != dp_size * tp_size:\n"
+        "            raise RuntimeError(\n"
+        "                f\"Expected {dp_size * tp_size} registrations for DP={dp_size}, \"\n"
+        "                f\"TP={tp_size}, got {num_workers}\"\n"
+        "            )\n",
+        "        local_workers = max(\n"
+        "            1,\n"
+        "            (dp_size * tp_size)\n"
+        "            // max(self.vllm_config.parallel_config.nnodes, 1),\n"
+        "        )\n"
+        "        if num_workers != local_workers:\n"
+        "            raise RuntimeError(\n"
+        "                f\"Expected {local_workers} registrations for DP={dp_size}, \"\n"
+        "                f\"TP={tp_size}, got {num_workers}\"\n"
+        "            )\n",
+    ),
+    (
+        "        if set(registrations_by_dp) != set(range(dp_size)):\n",
+        "        if not registrations_by_dp or not (\n"
+        "            set(registrations_by_dp) <= set(range(dp_size))\n"
+        "        ):\n",
+    ),
+    (
+        "            tp_ranks = {registration.tp_rank for registration in dp_registrations}\n"
+        "            if tp_ranks != set(range(tp_size)):\n",
+        "            tp_ranks = {registration.tp_rank for registration in dp_registrations}\n"
+        "            if not tp_ranks or not tp_ranks <= set(range(tp_size)):\n",
+    ),
+    # Input buffers: TP0's copy always wins (it is the only one staged on a
+    # single node); on a node whose ranks are all non-zero TP, take the first
+    # registration — its leader stages into its own buffers.
+    (
+        "            if registration.tp_rank == 0:\n",
+        "            if (\n"
+        "                registration.tp_rank == 0\n"
+        "                or registration.dp_rank not in self._input_bufs\n"
+        "            ):\n",
+    ),
+    (
+        "        if set(self._input_bufs) != set(range(dp_size)):\n",
+        "        if set(self._input_bufs) != set(registrations_by_dp):\n",
+    ),
+    (
+        "                if len(targets) != tp_size:\n"
+        "                    raise RuntimeError(\n"
+        "                        f\"PLE layer {layer_name} for DP rank {dp_rank} received \"\n"
+        "                        f\"{len(targets)} targets, expected {tp_size}\"\n"
+        "                    )\n",
+        "                if not targets or len(targets) > tp_size:\n"
+        "                    raise RuntimeError(\n"
+        "                        f\"PLE layer {layer_name} for DP rank {dp_rank} received \"\n"
+        "                        f\"{len(targets)} targets, expected 1..{tp_size}\"\n"
+        "                    )\n",
     ),
 ])
 print("ok")

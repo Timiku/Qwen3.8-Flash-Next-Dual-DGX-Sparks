@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MiaAI Lab (https://x.com/MiaAI_lab)
 """Patch ple_layer.py for mixed NVFP4 + FP8 PLE checkpoint loading.
 
 Ports the PLE quant dispatch from vLLM PR #53899 (qwen4_exp) onto the
@@ -17,6 +19,44 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ORIG = os.path.join(HERE, "ple_layer_patched.py.orig")
 OUT = os.path.join(HERE, "ple_layer_patched.py")
+
+PREFETCH_BLOCK = '''
+_PLE_PAGE_SHIFT = 12
+_PLE_PAGE = 1 << _PLE_PAGE_SHIFT
+
+
+def _ple_prefetch_rows(fd, ids, row_width) -> None:
+    """Queue every page a row gather will touch, in one batch.
+
+    torch.index_select over the 27 GiB packed table is one CPU thread walking
+    a list of unrelated 90-byte rows. PyTorch only parallelises index_select
+    past a ~32k-element grain, and a decode batch gathers 64-320 rows, so each
+    missing 4 KiB page is faulted in on its own at queue depth 1 (~77 us on
+    this NVMe) while the GPU worker spins waiting for the handshake. Naming
+    all of the pages up front lets the device see them at once; the gather
+    that follows finds them resident or already in flight.
+
+    Advisory only: any failure just leaves the original fault-per-row path.
+    """
+    if fd is None or ids is None or ids.numel() == 0:
+        return
+    try:
+        offsets = ids.to(torch.int64) * row_width
+        pages = torch.cat(
+            (
+                offsets >> _PLE_PAGE_SHIFT,
+                (offsets + row_width - 1) >> _PLE_PAGE_SHIFT,
+            )
+        )
+        # unique() sorts, so the reads are issued in ascending file order.
+        for page in torch.unique(pages).tolist():
+            os.posix_fadvise(
+                fd, page << _PLE_PAGE_SHIFT, _PLE_PAGE, os.POSIX_FADV_WILLNEED
+            )
+    except Exception:  # pragma: no cover - advisory prefetch only
+        pass
+
+'''
 
 NVFP4_BLOCK = """
 _NVFP4_BLOCK_SIZE = 16
@@ -189,8 +229,7 @@ def _get_ple_embedding_quant_method(
 ) -> QuantizeMethodBase | None:
     """Select a packed PLE embedding method for quantized checkpoint shards."""
 
-    # MIXED_PRECISION checkpoints (modelopt_mixed) declare the PLE table
-    # format in text_config.ple_embedding_dtype, not via ModelOptNvFp4Config.
+    # Some checkpoints declare PLE storage directly in text_config.
     if _ple_dtype_is_nvfp4(ple_embedding_dtype):
         logger.info_once(
             "PLE embedding %s uses the runtime NVFP4 method (ple_embedding_dtype)",
@@ -203,6 +242,20 @@ def _get_ple_embedding_quant_method(
             prefix,
         )
         return Qwen3_8FlashNextPLEFp8EmbeddingMethod()
+
+    if isinstance(quant_config, ModelOptMixedPrecisionConfig):
+        # NVIDIA stores this in quantized_layers, without ple_embedding_dtype.
+        # Use vLLM's resolver: apply_vllm_mapper has already renamed HF prefixes.
+        algo = quant_config._resolve_quant_algo(prefix)
+        if algo == "FP8":
+            logger.info_once("PLE embedding %s uses ModelOpt mixed FP8", prefix)
+            return Qwen3_8FlashNextPLEFp8EmbeddingMethod()
+        if algo == "NVFP4":
+            logger.info_once("PLE embedding %s uses ModelOpt mixed NVFP4", prefix)
+            return Qwen3_8FlashNextPLENVFp4EmbeddingMethod()
+        if algo is not None:
+            raise ValueError(f"Unsupported ModelOpt PLE storage {algo}: {prefix}")
+        return None
 
     if isinstance(quant_config, Fp8Config):
         if not quant_config.is_checkpoint_fp8_serialized:
@@ -528,9 +581,10 @@ def main() -> None:
         (
             "from vllm.forward_context import get_forward_context\n",
             "from vllm.forward_context import get_forward_context\n"
+            "import os\n"
             "from vllm.logger import init_logger\n"
             "from vllm.model_executor.layers.quantization.modelopt import "
-            "ModelOptNvFp4Config\n"
+            "ModelOptNvFp4Config, ModelOptMixedPrecisionConfig\n"
             "from vllm.model_executor.utils import set_weight_attrs\n\n"
             "logger = init_logger(__name__)\n",
         ),
@@ -540,6 +594,7 @@ def main() -> None:
             "def _get_ple_embedding_quant_method(\n",
             "    def embedding(self, layer: nn.Module, input_: torch.Tensor) -> torch.Tensor:\n"
             "        return F.embedding(input_, layer.weight)\n\n\n"
+            + PREFETCH_BLOCK
             + NVFP4_BLOCK
             + "\n"
             + GET_QUANT_METHOD
@@ -781,8 +836,12 @@ def main() -> None:
             "                row_width = packed.shape[-1]\n"
             "                total_width = ngram_ids.shape[-1] * row_width\n"
             "                output = output_buffer[:num_tokens, :total_width]\n"
+            "                _ple_prefetch_rows(\n"
+            "                    getattr(emb, \"_packed_table_fd\", None), ids, row_width\n"
+            "                )\n"
             "                torch.index_select(\n"
-            "                    packed, 0, ids, out=output.reshape(-1, row_width)\n"
+            "                    packed, 0, ids,\n"
+            "                    out=output.reshape(-1, row_width).view(torch.uint8)\n"
             "                )\n"
             "                return output\n"
             "            if scales is not None and scales.dim() == 2:\n"

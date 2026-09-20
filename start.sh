@@ -857,6 +857,73 @@ if $DO_LAUNCH; then
     WORKER_MODELOPT_MOUNT="-v /tmp/modelopt_patched.py:$MODEL_OPT_PKG:ro"
 
     # ---------------------------------------------------------------------------
+    # 6c. PLE CPU-offload overlays (ported from the single-Spark kit).
+    #     With PLE_OFFLOAD=true the 26.8 GiB NVFP4 n-gram table leaves the GPU:
+    #     EACH NODE spawns its own PleOffloadWorker (the registrations ride on
+    #     CUDA-IPC and node-local ZMQ, so they cannot cross nodes — see the
+    #     multi-node section of files/patch_ple_offload.py), serving the table
+    #     from a memory-mapped pre-packed file on that node's NVMe — page-cache
+    #     backed, so the table's home is the disk with only touched pages
+    #     resident, not a 26.8 GiB anonymous RAM copy. Both GB10 fixes ride
+    #     along (no stream-memory-ops, done-flag handshake) plus MADV_RANDOM
+    #     and the batched posix_fadvise prefetch.
+    #     The five patched files bind-mount over the package on BOTH nodes
+    #     (protocol/worker must be byte-identical for the registration pickle).
+    # ---------------------------------------------------------------------------
+    if [[ "$PLE_OFFLOAD" == "true" ]]; then
+        info "=== Step 6c: PLE offload overlays + packed table ==="
+        OFFLOAD_DIR="$SCRIPT_DIR/files/ple_offload"
+        # The image's gpu_worker.py owns the spawn/registration wiring; keep a
+        # local orig so the patcher can regenerate the overlay from it.
+        extract_from_image "$VLLM_PKG/v1/worker/gpu_worker.py" "$OFFLOAD_DIR/orig/gpu_worker.py"
+        # Regenerate from the tracked orig/ pair (fail-loud on anchor drift).
+        python3 "$SCRIPT_DIR/files/patch_ple_offload.py"
+        for _f in ple_offload_layer connector worker protocol gpu_worker; do
+            [[ -f "$OFFLOAD_DIR/$_f.py" ]] || err "offload patch missing: $_f.py"
+        done
+        add_overlay "$OFFLOAD_DIR/ple_offload_layer.py" "$VLLM_PKG/model_executor/layers/ple_offload_layer.py"
+        add_overlay "$OFFLOAD_DIR/connector.py"         "$VLLM_PKG/v1/ple_offload/connector.py"
+        add_overlay "$OFFLOAD_DIR/worker.py"            "$VLLM_PKG/v1/ple_offload/worker.py"
+        add_overlay "$OFFLOAD_DIR/protocol.py"          "$VLLM_PKG/v1/ple_offload/protocol.py"
+        add_overlay "$OFFLOAD_DIR/gpu_worker.py"        "$VLLM_PKG/v1/worker/gpu_worker.py"
+
+        # Packed table, built once on the head and pushed to the worker (each
+        # node's offload process mmaps its OWN file).
+        PLE_PACKED_HOST="$HOME/.cache/vllm/ple_cache/${ORG}--${NAME}"
+        PLE_PACKED_CTR="/root/.cache/vllm/ple_cache/${ORG}--${NAME}"
+        if ! ls "$PLE_PACKED_HOST"/*.packed_u8 >/dev/null 2>&1; then
+            info "Building packed PLE table (one-time, ~40 s, <1 GiB RAM, no GPU)..."
+            mkdir -p "$PLE_PACKED_HOST"
+            # The snapshot's files are relative links that chain two levels up
+            # (model blobs -> hub CAS blobs). Mount the model dir's parent so
+            # the whole chain resolves inside the container; the model dir alone
+            # leaves the second hop dangling.
+            docker run --rm --name "${CONTAINER_NAME:-vllm-fn}-plebuild" --memory 6g --cpus 8 \
+                -v "$(dirname "$MODEL_DIR"):/m:ro" -v "$HOME/.cache/vllm/ple_cache:/out" \
+                -v "$SCRIPT_DIR/files/build_ple_packed_table.py:/b.py:ro" \
+                --entrypoint python3 "$IMAGE" -u /b.py \
+                "/m/$(basename "$MODEL_DIR")/snapshots/$SNAP" "/out/${ORG}--${NAME}"
+        fi
+        ls "$PLE_PACKED_HOST"/*.packed_u8 >/dev/null 2>&1 || err "packed table missing after build"
+        ok "Packed PLE table: $(ls "$PLE_PACKED_HOST"/*.packed_u8 | head -1) ($(du -sh "$PLE_PACKED_HOST" | cut -f1))"
+
+        # The worker's offload process mmaps its OWN copy — CUDA-IPC handles
+        # never cross nodes, so the table lives on both NVMe drives. One-time
+        # push; --size-only keeps the check cheap across reboots.
+        if ! ssh_worker "test -f '$REMOTE_HOME/.cache/vllm/ple_cache/${ORG}--${NAME}/$(basename "$(ls "$PLE_PACKED_HOST"/*.packed_u8 | head -1)")'"; then
+            info "  Pushing packed PLE table to worker (~27 GiB, a few seconds over IB)..."
+            ssh_worker "mkdir -p '$REMOTE_HOME/.cache/vllm/ple_cache/${ORG}--${NAME}'"
+            rsync -a --partial "$PLE_PACKED_HOST/" \
+                "${WORKER_USER:+${WORKER_USER}@}${WORKER_IP}:${REMOTE_HOME}/.cache/vllm/ple_cache/${ORG}--${NAME}/"
+        else
+            ok "Worker already has the packed PLE table."
+        fi
+
+        OVERLAY_ENV+=("-e VLLM_PLE_PACKED_TABLE_DIR=$PLE_PACKED_CTR")
+        OVERLAY_ENV+=("-e VLLM_PLE_OFFLOAD_STEP_TIMEOUT=300")
+    fi
+
+    # ---------------------------------------------------------------------------
     # 7. Build vLLM args (shared between head and worker)
     # ---------------------------------------------------------------------------
     info "=== Step 7: Launch vLLM ==="
