@@ -27,7 +27,7 @@ and the sparkDash numbers both include foreign traffic.
 """
 import argparse, json, re, subprocess, sys, threading, time, urllib.error, urllib.request
 
-DASH = "http://localhost:5555/api/sparks/spark-1/llm/bench"
+DASH = "http://localhost:5555/api/sparks/spark1/llm/bench"
 METRICS = "http://localhost:8888/metrics"
 COUNTERS = [
     "vllm:inter_token_latency_seconds_sum",
