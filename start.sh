@@ -119,7 +119,7 @@ PLE_OFFLOAD="${PLE_OFFLOAD:-false}"
 # PYTHONHASHSEED=0, which the arm sets. See docs/plans/kv-offload-spark.md.
 KV_OFFLOAD="${KV_OFFLOAD:-false}"
 KV_ROOT="${KV_ROOT:-$HOME/fn-kv}"                 # head-side store root
-KV_ROOT_WORKER="${KV_ROOT_WORKER:-$REMOTE_HOME/fn-kv}"
+KV_ROOT_WORKER="${KV_ROOT_WORKER:-}"              # empty -> worker $HOME/fn-kv (resolved in 6d; REMOTE_HOME is defined later)
 KV_CAPACITY_GIB="${KV_CAPACITY_GIB:-500}"         # disk-free sanity floor
 KV_IO_THREADS="${KV_IO_THREADS:-6}"               # per-process NVMe io threads
 KV_PROMPT_ONLY="${KV_PROMPT_ONLY:-false}"         # false = persist generated turns too
@@ -950,6 +950,9 @@ if $DO_LAUNCH; then
     KV_HEAD_MOUNTS=""; KV_WORKER_MOUNTS=""; KV_ENV=""
     if [[ "$KV_OFFLOAD" == "true" ]]; then
         info "=== Step 6d: KV-cache offload (NVMe-direct) ==="
+        # The worker's store root defaults to its OWN $HOME (REMOTE_HOME is
+        # resolved early in the script; $HOME inside ssh_worker is the worker's).
+        [[ -n "$KV_ROOT_WORKER" ]] || KV_ROOT_WORKER="${KV_ROOT:-$HOME/fn-kv}"
         case "$EXTRA_VLLM_ARGS" in
             *--kv-transfer-config*)
                 err "KV_OFFLOAD=true and an EXTRA_VLLM_ARGS --kv-transfer-config conflict - pick one." ;;
