@@ -110,6 +110,55 @@ SCRATCH_TEST = (
 )
 
 sch_edits = [
+    # 0) lookup entry + verdict diagnostics: which link of the chain is dead?
+    (
+        """        req_status = self._req_status[request.request_id]
+        for group_state in req_status.group_states:
+            group_state.block_ids.clear()
+
+        if req_status.transfer_jobs:""",
+        """        req_status = self._req_status[request.request_id]
+        for group_state in req_status.group_states:
+            group_state.block_ids.clear()
+        logger.info(
+            "[fn-kv-offload] lookup req=%s computed=%d hashes=%d"
+            " lookup_groups=%d skip_read=%s jobs=%d",
+            request.request_id, num_computed_tokens,
+            len(request.block_hashes), len(self._lookup_groups),
+            request.skip_reading_prefix_cache, len(req_status.transfer_jobs),
+        )
+
+        if req_status.transfer_jobs:""",
+    ),
+    # 0b) _lookup verdict: what did the group scan converge to?
+    (
+        """    def _lookup(self, req_status: RequestOffloadState) -> int | None:
+        complete_hit = self._lookup_complete_chunks(req_status)""",
+        """    def _lookup(self, req_status: RequestOffloadState) -> int | None:
+        complete_hit = self._lookup_complete_chunks(req_status)
+        logger.info(
+            "[fn-kv-offload] scan req=%s complete_hit=%s partial_tail_ok=%s",
+            req_status.req.request_id, complete_hit,
+            self.config.supports_partial_tail,
+        )""",
+    ),
+    # 0c) connector return: what the scheduler actually receives
+    (
+        """        req_status.update_num_hit_chunks(num_computed_tokens + (num_hit_tokens or 0))
+
+        self._touch(req_status)
+
+        return num_hit_tokens, bool(num_hit_tokens)""",
+        """        req_status.update_num_hit_chunks(num_computed_tokens + (num_hit_tokens or 0))
+
+        self._touch(req_status)
+
+        logger.info(
+            "[fn-kv-offload] verdict req=%s hit=%s async=%s",
+            request.request_id, num_hit_tokens, bool(num_hit_tokens),
+        )
+        return num_hit_tokens, bool(num_hit_tokens)""",
+    ),
     # 1) window classifier: tolerate the ring's unknown spec class
     (
         """    assert isinstance(kv_cache_spec, FullAttentionSpec)
@@ -121,6 +170,23 @@ sch_edits = [
             type(kv_cache_spec).__name__,
         )
     return None""",
+    ),
+    # 1b) align-mode mamba groups are full-attention-like: state blocks per
+    #     chunk must survive in the block table (see the classifier comment)
+    (
+        """    if isinstance(kv_cache_spec, MambaSpec):
+        # Mamba depends on a single state
+        return 1""",
+        """    if isinstance(kv_cache_spec, MambaSpec):
+        # [fn-kv-offload] align mode caches a state per chunk; the block
+        # table must keep all of them or the per-chunk states never reach
+        # the store and every external hit collapses to zero (measured:
+        # boundary state file missing, complete_hit=0). The single-state
+        # window only describes none-mode running states.
+        if getattr(kv_cache_spec, "mamba_cache_mode", "none") == "align":
+            return None
+        # Mamba depends on a single state
+        return 1""",
     ),
     # 2) GroupOffloadConfig: the is_scratch field
     (

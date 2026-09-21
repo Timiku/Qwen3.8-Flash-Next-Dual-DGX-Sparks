@@ -72,7 +72,10 @@ from vllm.v1.kv_offload.base import (
 )
 from vllm.v1.kv_offload.config import OffloadingConfig
 
-logger = init_logger(__name__)
+# Under the vllm logger hierarchy so the engine's log config (level,
+# handlers) reaches this module; a bare "kvoffload.*" logger would drop
+# INFO lines into a hierarchy nobody configures.
+logger = init_logger("vllm.kvoffload.nvme_direct2")
 
 FORMAT_TAG = "nvme-direct/fn-v1"
 SIDE_CAR = "config.json"
@@ -147,6 +150,12 @@ def _fence_fields(config: OffloadingConfig, revision: str) -> dict[str, Any]:
         "pcp_size": int(par.pcp_size),
         "dcp_size": int(par.dcp_size),
         "groups": groups,
+        # State semantics differ between align (state per chunk, restorable)
+        # and none (one running state per request): a mode change must land
+        # in its own namespace or restores read meaningless state bytes.
+        "mamba_cache_mode": str(
+            config.extra_config.get("mamba_cache_mode") or "none"
+        ),
         "engine": engine,
         "stamp": _env_or_none("FN_KV_RECIPE_STAMP") or "unknown",
         "format": FORMAT_TAG,
@@ -269,7 +278,16 @@ class NvmeDirectManager2(OffloadingManager):
                 return LookupResult.HIT
             self._exists.discard(key)
             return LookupResult.MISS
-        if os.path.exists(self._path(key)):
+        hit = os.path.exists(self._path(key))
+        # [fn-kv-offload] diagnosis: every cold lookup names itself. The
+        # volume is one line per 1664-token chunk; a session restores in
+        # tens of lines. Demote via KV_OFFLOAD_QUIET_LOOKUP=1 if noisy.
+        if not os.environ.get("KV_OFFLOAD_QUIET_LOOKUP"):
+            logger.info(
+                "nvme2 lookup %s -> %s", _relpath(key),
+                "HIT" if hit else "miss",
+            )
+        if hit:
             self._exists.add(key)
             return LookupResult.HIT
         return LookupResult.MISS
@@ -318,6 +336,8 @@ class NvmeDirectManager2(OffloadingManager):
         # Callers pass keys already resolved to HIT; files are immutable and
         # nothing here is evictable, so there is nothing to protect - just
         # hand back the paths in key order.
+        if not os.environ.get("KV_OFFLOAD_QUIET_LOOKUP"):
+            logger.info("nvme2 prepare_load: %d keys", len(keys))
         return NvmeFileLoadStoreSpec([_relpath(k) for k in keys])
 
     @override

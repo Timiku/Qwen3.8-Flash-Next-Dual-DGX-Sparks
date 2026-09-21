@@ -123,6 +123,12 @@ KV_ROOT_WORKER="${KV_ROOT_WORKER:-}"              # empty -> worker $HOME/fn-kv 
 KV_CAPACITY_GIB="${KV_CAPACITY_GIB:-500}"         # disk-free sanity floor
 KV_IO_THREADS="${KV_IO_THREADS:-6}"               # per-process NVMe io threads
 KV_PROMPT_ONLY="${KV_PROMPT_ONLY:-false}"         # false = persist generated turns too
+# Hybrid-state cache mode for KV_OFFLOAD boots. align = state blocks per
+# hash chunk (REQUIRED for restores: the boundary state must exist on disk
+# per chunk; "none" keeps one running state per request, which no external
+# load can serve). Empty defers to the arm (6d defaults it to align there)
+# or to the image default when the arm is off; set none/align to pin it.
+MAMBA_CACHE_MODE="${MAMBA_CACHE_MODE:-}"
 # Vision MLP intermediate_size=4304 is not divisible by 16 after TP split (4304/2=2152).
 # NVFP4 kernels require input features % 16 == 0, so replicate the encoder on each GPU.
 MM_ENCODER_TP_MODE="${MM_ENCODER_TP_MODE:-data}"
@@ -984,19 +990,25 @@ if $DO_LAUNCH; then
         # regenerate from it every launch, fail loud on anchor drift).
         #  - offloading/config.py: assert -> classified receipt (insurance;
         #    our geometry is aligned, see the generator docstring).
+        #  - offloading/scheduler.py: is_scratch exclusion for the QSA
+        #    indexer ring (CircularBufferSpec, block 8, 13 layers) — GLM #58
+        #    touchpoint port; REQUIRED, the boot assert is upstream of it.
         #  - mamba_hybrid.py + scheduler.py: the blazux align-mode block-size
         #    fix — REQUIRED for correct restore-on-hit of the hybrid state
         #    (port of patch_mamba_block_size.py, Apache-2.0).
         KVCFG="$VLLM_PKG/distributed/kv_transfer/kv_connector/v1/offloading/config.py"
+        KVSGD="$VLLM_PKG/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py"
         MHYB="$VLLM_PKG/v1/worker/gpu/model_states/mamba_hybrid.py"
         SCHD="$VLLM_PKG/v1/core/sched/scheduler.py"
         mkdir -p "$SCRIPT_DIR/files/kvoffload/orig" "$SCRIPT_DIR/files/kv/orig"
         extract_from_image "$KVCFG" "$SCRIPT_DIR/files/kvoffload/orig/config.py"
+        extract_from_image "$KVSGD" "$SCRIPT_DIR/files/kvoffload/orig/scheduler.py"
         extract_from_image "$MHYB" "$SCRIPT_DIR/files/kv/orig/mamba_hybrid.py"
         extract_from_image "$SCHD" "$SCRIPT_DIR/files/kv/orig/scheduler.py"
         if [[ "${KV_SKIP_GROUPS_PATCH:-0}" != "1" ]]; then
             python3 "$SCRIPT_DIR/files/patch_kv_offload_groups.py" || err "kv groups patch failed"
             add_overlay "$SCRIPT_DIR/files/kvoffload/config_patched.py" "$KVCFG"
+            add_overlay "$SCRIPT_DIR/files/kvoffload/scheduler_patched.py" "$KVSGD"
         fi
         if [[ "${KV_SKIP_MAMBA_FIX:-0}" != "1" ]]; then
             python3 "$SCRIPT_DIR/files/patch_mamba_block_size.py" || err "mamba block-size patch failed"
@@ -1008,11 +1020,29 @@ if $DO_LAUNCH; then
             warn "     for A/B experiments; never ship with it."
         fi
         _KVT_PROMPT_ONLY=true; [[ "$KV_PROMPT_ONLY" == "false" ]] && _KVT_PROMPT_ONLY=false
+        # Hybrid state mode: restores need the boundary state per chunk, so
+        # the arm defaults to align; none is possible but external hits
+        # collapse (measured: 54/72 state files missing, hit = 0).
+        [[ -n "$MAMBA_CACHE_MODE" ]] || MAMBA_CACHE_MODE="align"
+        case "$MAMBA_CACHE_MODE" in align|none) ;; *) err "MAMBA_CACHE_MODE must be align or none (got '$MAMBA_CACHE_MODE')" ;; esac
+        # State snapshots must align to the hash chunk (1664): the kernel's
+        # native step (mamba_block_size=None -> ~5 chunks) leaves holes at
+        # chunk 0, 5, 10... and every external hit collapses (measured:
+        # exactly one state-file miss per request at chunk 0, five requests,
+        # five boots). KV_MAMBA_BLOCK_SIZE=0 keeps the image default.
+        KV_MAMBA_BLOCK_SIZE="${KV_MAMBA_BLOCK_SIZE:-1664}"
+        [[ "$KV_MAMBA_BLOCK_SIZE" != "0" ]] && \
+            VLLM_MAMBA_BLOCK=("--mamba-block-size" "$KV_MAMBA_BLOCK_SIZE") \
+            || VLLM_MAMBA_BLOCK=()
+        # MODEL_REVISION (optional) overrides the fence revision so a test or
+        # recovery boot lands in its own namespace instead of adopting the
+        # live one; default is the HF snapshot hash.
+        KV_REVISION="${MODEL_REVISION:-$SNAP}"
         # Compact JSON (no spaces) wrapped in LITERAL single quotes: the
         # rendered launch scripts expand $VLLM_ARGS_STR as source, and the
         # quotes keep bash brace-expansion out of the commas (same pattern as
         # --speculative-config above).
-        KV_XFER_JSON="'{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"spec_name\":\"NvmeDirectOffloadingSpec2\",\"spec_module_path\":\"kvoffload.nvme_direct2\",\"root_dir\":\"/mnt/fn-kv\",\"model_name\":\"${MODEL_ID}\",\"model_revision\":\"${SNAP}\",\"capacity_bytes\":${KV_CAPACITY},\"n_io_threads\":${KV_IO_THREADS},\"offload_prompt_only\":${_KVT_PROMPT_ONLY}}}'"
+        KV_XFER_JSON="'{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"spec_name\":\"NvmeDirectOffloadingSpec2\",\"spec_module_path\":\"kvoffload.nvme_direct2\",\"root_dir\":\"/mnt/fn-kv\",\"model_name\":\"${MODEL_ID}\",\"model_revision\":\"${KV_REVISION}\",\"capacity_bytes\":${KV_CAPACITY},\"n_io_threads\":${KV_IO_THREADS},\"offload_prompt_only\":${_KVT_PROMPT_ONLY},\"mamba_cache_mode\":\"${MAMBA_CACHE_MODE}\"}}'"
         ok "KV offload ON: root=$KV_ROOT (worker $KV_ROOT_WORKER), cap=${KV_CAPACITY_GIB} GiB, prompt_only=${_KVT_PROMPT_ONLY}"
         # The connector path costs ~11.5 GiB of post-capture consumption on
         # this box (boot 20260920T190603: consumed 54.86 vs 43.39 GiB without
@@ -1034,6 +1064,12 @@ if $DO_LAUNCH; then
     info "=== Step 7: Launch vLLM ==="
 
     VLLM_ARGS=()
+    # Hybrid state mode rides with the KV arm (the flag must come after this
+    # reinit; 6d resolved the knob and validated the value).
+    if [[ "$KV_OFFLOAD" == "true" && -n "$MAMBA_CACHE_MODE" ]]; then
+        VLLM_ARGS+=("--mamba-cache-mode" "$MAMBA_CACHE_MODE")
+        VLLM_ARGS+=(${VLLM_MAMBA_BLOCK[@]+"${VLLM_MAMBA_BLOCK[@]}"})
+    fi
     VLLM_ARGS+=("--enable-prompt-tokens-details")
     VLLM_ARGS+=("--served-model-name" "$SERVED_MODEL_NAME")
     VLLM_ARGS+=("--tensor-parallel-size" "$TENSOR_PARALLEL_SIZE")

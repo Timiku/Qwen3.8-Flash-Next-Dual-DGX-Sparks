@@ -123,6 +123,13 @@ def get_sliding_window_size_in_chunks(
         return cdiv(kv_cache_spec.attention_chunk_size, tokens_per_chunk)
 
     if isinstance(kv_cache_spec, MambaSpec):
+        # [fn-kv-offload] align mode caches a state per chunk; the block
+        # table must keep all of them or the per-chunk states never reach
+        # the store and every external hit collapses to zero (measured:
+        # boundary state file missing, complete_hit=0). The single-state
+        # window only describes none-mode running states.
+        if getattr(kv_cache_spec, "mamba_cache_mode", "none") == "align":
+            return None
         # Mamba depends on a single state
         return 1
 
@@ -918,6 +925,11 @@ class OffloadingConnectorScheduler:
 
     def _lookup(self, req_status: RequestOffloadState) -> int | None:
         complete_hit = self._lookup_complete_chunks(req_status)
+        logger.info(
+            "[fn-kv-offload] scan req=%s complete_hit=%s partial_tail_ok=%s",
+            req_status.req.request_id, complete_hit,
+            self.config.supports_partial_tail,
+        )
         req_status.partial_tail_boundary = None
         if complete_hit is None or not self.config.supports_partial_tail:
             return complete_hit
@@ -1001,6 +1013,13 @@ class OffloadingConnectorScheduler:
         req_status = self._req_status[request.request_id]
         for group_state in req_status.group_states:
             group_state.block_ids.clear()
+        logger.info(
+            "[fn-kv-offload] lookup req=%s computed=%d hashes=%d"
+            " lookup_groups=%d skip_read=%s jobs=%d",
+            request.request_id, num_computed_tokens,
+            len(request.block_hashes), len(self._lookup_groups),
+            request.skip_reading_prefix_cache, len(req_status.transfer_jobs),
+        )
 
         if req_status.transfer_jobs:
             logger.debug(
@@ -1031,6 +1050,10 @@ class OffloadingConnectorScheduler:
 
         self._touch(req_status)
 
+        logger.info(
+            "[fn-kv-offload] verdict req=%s hit=%s async=%s",
+            request.request_id, num_hit_tokens, bool(num_hit_tokens),
+        )
         return num_hit_tokens, bool(num_hit_tokens)
 
     def update_state_after_alloc(
