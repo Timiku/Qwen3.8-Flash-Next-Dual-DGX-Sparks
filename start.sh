@@ -1014,6 +1014,18 @@ if $DO_LAUNCH; then
         # --speculative-config above).
         KV_XFER_JSON="'{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"spec_name\":\"NvmeDirectOffloadingSpec2\",\"spec_module_path\":\"kvoffload.nvme_direct2\",\"root_dir\":\"/mnt/fn-kv\",\"model_name\":\"${MODEL_ID}\",\"model_revision\":\"${SNAP}\",\"capacity_bytes\":${KV_CAPACITY},\"n_io_threads\":${KV_IO_THREADS},\"offload_prompt_only\":${_KVT_PROMPT_ONLY}}}'"
         ok "KV offload ON: root=$KV_ROOT (worker $KV_ROOT_WORKER), cap=${KV_CAPACITY_GIB} GiB, prompt_only=${_KVT_PROMPT_ONLY}"
+        # The connector path costs ~11.5 GiB of post-capture consumption on
+        # this box (boot 20260920T190603: consumed 54.86 vs 43.39 GiB without
+        # the arm; the capture peak then dips host avail under the memwatch
+        # floor and the watchdog kills the boot). Give the margin back out of
+        # the KV pool: 0.835 - 0.055 = 0.78, the GMU the PLE disk tier already
+        # measured good (11+ GiB host headroom). Set KV_GMU_DELTA=0 to keep
+        # the .env GMU as-is.
+        KV_GMU_DELTA="${KV_GMU_DELTA:-0.055}"
+        if [[ "$GPU_MEMORY_UTILIZATION" == "0.835" && "$KV_GMU_DELTA" != "0" ]]; then
+            GPU_MEMORY_UTILIZATION=$(python3 -c "print(f'{$GPU_MEMORY_UTILIZATION - $KV_GMU_DELTA:.3f}')")
+            info "  KV arm: GMU -> $GPU_MEMORY_UTILIZATION (delta -$KV_GMU_DELTA; connector consumes ~11 GiB extra)"
+        fi
     fi
 
     # ---------------------------------------------------------------------------

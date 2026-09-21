@@ -1,49 +1,71 @@
 #!/usr/bin/env python3
-"""KV-offload group classifier for the dual kit (image: offloading/config.py).
+"""KV-offload scratch-group handling for the dual kit.
 
-The connector's build_offloading_config hard-asserts that every KV cache
-group's tokens_per_block is divisible by tokens_per_hash — the boot blocker
-GLM issue #57 mode 1 records for hybrids. This flash-next build's geometry
-(attention 1664 / mamba 1600 vs hash 64) IS divisible, so the assert passes
-and this patch's job is legibility insurance: replace the bare AssertionError
-with a classified failure that names the offending group, and print the
-geometry receipt on the aligned boot. Full scratch-group EXCLUSION (GLM
-PR #58's 13 scheduler touchpoints) is deliberately not ported — it only pays
-for a real scratch group; if one ever appears here, that exclusion is the
-follow-up, not a silent half-measure baked into this patch.
+Two overlays, one story. The flash-next KV pool has one group that cannot
+align to the offload hash chunk: the QSA indexer ring (CircularBufferSpec,
+block 8, 13 layers = 12 full-attention layers' side caches + the MTP layer's).
+It holds the open group's committed keys plus un-accepted speculative rows —
+volatile per-request scratch by design (see qsa_cache.py's ring comment).
+The connector's build_offloading_config asserts every group's
+tokens_per_block is divisible by tokens_per_hash=1664; the ring's 8 is not,
+and GLM issue #57 mode 1 records the same shape for their indexer tail.
 
-Drafter groups need nothing here: this build's offloading scheduler already
-classifies EAGLE/MTP draft groups (kv_cache_config.is_eagle_group, set in
-kv_cache_utils) and excludes their volatile tail itself.
+  config.py    assert -> classified warning + geometry receipt. The ring is
+               named at boot instead of killing it.
+  scheduler.py GLM #58's touchpoint set, ported: an is_scratch flag on
+               GroupOffloadConfig, set for any group whose tokens_per_block
+               is misaligned or narrower than the widest group. Scratch
+               groups contribute nothing to offload stores, loads, lookups,
+               or hit bookkeeping; their data stays GPU-local and is rebuilt
+               per request (exactly what GPU prefix caching already does for
+               the ring). The window classifier learns to tolerate the
+               unknown spec class with a warning instead of asserting.
 
-Input:  files/kvoffload/orig/config.py     (extracted from the image)
-Output: files/kvoffload/config_patched.py  (bind-mounted over the package)
-Fail-closed: anchors verified unique, compile-checked; anchor drift aborts.
-Kill switch: KV_SKIP_GROUPS_PATCH=1 (start.sh then skips both this and the
-connector mounts — KV_OFFLOAD must be false in that case).
+Inputs:  files/kvoffload/orig/{config,scheduler}.py  (extracted from image)
+Outputs: files/kvoffload/config_patched.py, files/kvoffload/scheduler_patched.py
+Fail-closed: every anchor must exist exactly once; outputs compile-checked;
+             anchor drift aborts the boot with the anchor text.
+Kill switch: KV_SKIP_GROUPS_PATCH=1 (start.sh then skips this and the
+             overlay mounts; KV_OFFLOAD must be false in that case).
 """
 import ast
 import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ORIG = os.path.join(HERE, "kvoffload", "orig", "config.py")
-OUT = os.path.join(HERE, "kvoffload", "config_patched.py")
+MARK = "# [fn-kv-offload]"
 
 if os.environ.get("KV_SKIP_GROUPS_PATCH") == "1":
     print("kv_offload groups patch skipped (KV_SKIP_GROUPS_PATCH=1)")
     raise SystemExit(0)
 
-src = open(ORIG).read()
 
-EDITS = [
-    # 1) logger for the geometry receipt
+def apply(orig: str, out: str, edits) -> None:
+    src = open(orig).read()
+    for old, new in edits:
+        count = src.count(old)
+        if count != 1:
+            sys.exit(f"{os.path.basename(orig)}: anchor count={count}, expected 1:\n{old[:200]}")
+        src = src.replace(old, new)
+    try:
+        ast.parse(src)
+    except SyntaxError as exc:
+        sys.exit(f"{os.path.basename(orig)}: patched output does not parse: {exc}")
+    open(out, "w").write(src)
+    print(f"patched {os.path.basename(out)}")
+
+
+# --------------------------------------------------------------------------
+# config.py: build_offloading_config receipt
+# --------------------------------------------------------------------------
+cfg_edits = [
+    # logger for the geometry receipt
     (
         "from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes\n",
-        "from vllm.logger import init_logger\n"
-        "from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes\n",
+        "from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes\n"
+        "from vllm.logger import init_logger\n",
     ),
-    # 2) assert -> classify
+    # assert -> classify (receipt prints the full geometry either way)
     (
         """    _, tokens_per_hash = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
     for group in groups:
@@ -54,22 +76,19 @@ EDITS = [
             f"--enable-prefix-caching to align block sizes."
         )""",
         """    _, tokens_per_hash = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
-    # [fn-kv-offload] classify instead of assert: an unaligned group is a
-    # boot error that names itself (GLM #57 mode 1 shape); an aligned hybrid
-    # (this kit's case) boots with a receipt of the geometry just validated.
-    _unaligned = {
-        i: g.tokens_per_block
-        for i, g in enumerate(groups)
-        if g.tokens_per_block % tokens_per_hash
-    }
-    if _unaligned:
-        raise ValueError(
-            "[fn-kv-offload] KV groups not divisible by tokens_per_hash="
-            f"{tokens_per_hash}: {sorted(_unaligned.items())} "
-            "({group_idx: tokens_per_block}). No scratch-group exclusion in "
-            "this build (see files/patch_kv_offload_groups.py docstring):"
-            " port GLM #58's scheduler touchpoints or run without KV_OFFLOAD."
-        )
+    # [fn-kv-offload] classify instead of assert: an unaligned group is the
+    # QSA indexer ring (CircularBufferSpec, block 8) - volatile per-request
+    # scratch, rebuilt on hit. The offloading scheduler's is_scratch
+    # touchpoints (same patch, on scheduler.py) exclude it from offload
+    # scheduling; a boot-time receipt records the full geometry.
+    for _i, _g in enumerate(groups):
+        if _g.tokens_per_block % tokens_per_hash:
+            init_logger(__name__).warning(
+                "[fn-kv-offload] scratch group %d (tokens_per_block=%d,"
+                " %d layers) is not divisible by tokens_per_hash=%d -"
+                " excluded from offload scheduling",
+                _i, _g.tokens_per_block, len(_g.layer_names), tokens_per_hash,
+            )
     init_logger(__name__).info(
         "[fn-kv-offload] %d KV groups offload-aligned (tokens_per_block=%s,"
         " tokens_per_hash=%d)",
@@ -80,19 +99,242 @@ EDITS = [
     ),
 ]
 
-for old, new in EDITS:
-    count = src.count(old)
-    if count != 1:
-        sys.exit(f"config.py: anchor count={count}, expected 1:\n{old[:200]}")
-    src = src.replace(old, new)
+# --------------------------------------------------------------------------
+# scheduler.py: is_scratch touchpoints (GLM #58 port, anchors re-verified
+# against this image's offloading/scheduler.py — naming differs from GLM's
+# fork: kv_spec not kv_cache_spec in from_spec)
+# --------------------------------------------------------------------------
+SCRATCH_TEST = (
+    """            if (tokens_per_block % spec.tokens_per_hash != 0
+                    or tokens_per_block < max(spec.tokens_per_block)):"""
+)
 
-if "from vllm.logger import init_logger" not in src:
-    sys.exit("config.py: init_logger import missing after edits")
+sch_edits = [
+    # 1) window classifier: tolerate the ring's unknown spec class
+    (
+        """    assert isinstance(kv_cache_spec, FullAttentionSpec)
+    return None""",
+        """    if not isinstance(kv_cache_spec, FullAttentionSpec):
+        logger.warning_once(
+            "[fn-kv-offload] spec %s treated as full attention for window"
+            " classification; is_scratch decides offloading",
+            type(kv_cache_spec).__name__,
+        )
+    return None""",
+    ),
+    # 2) GroupOffloadConfig: the is_scratch field
+    (
+        """    # True for EAGLE/MTP draft-model attention groups. The trailing chunk
+    # of these groups is volatile and lacks a stable hash, so it must
+    # be excluded from store and load scheduling.
+    is_eagle_group: bool = False""",
+        """    # True for EAGLE/MTP draft-model attention groups. The trailing chunk
+    # of these groups is volatile and lacks a stable hash, so it must
+    # be excluded from store and load scheduling.
+    is_eagle_group: bool = False
+    # [fn-kv-offload] per-request scratch group (e.g. the QSA indexer ring):
+    # contributes nothing to offload stores/loads/lookups; its data is
+    # rebuilt per request, the same way GPU prefix caching treats it.
+    is_scratch: bool = False""",
+    ),
+    # 3) from_spec alignment scan: skip scratch candidates
+    (
+        """        full_attn_tokens_per_chunk: set[int] = set()
+        for idx, tokens_per_block in enumerate(spec.tokens_per_block):
+            kv_spec = kv_cache_config.kv_cache_groups[idx].kv_cache_spec
+            sw = get_sliding_window_size_in_chunks(
+                kv_spec, tokens_per_block * spec.blocks_per_chunk
+            )
+            if sw is None:
+                full_attn_tokens_per_chunk.add(tokens_per_block * spec.blocks_per_chunk)""",
+        """        full_attn_tokens_per_chunk: set[int] = set()
+        for idx, tokens_per_block in enumerate(spec.tokens_per_block):
+"""
+        + SCRATCH_TEST
+        + """
+                continue  # [fn-kv-offload] scratch group
+            kv_spec = kv_cache_config.kv_cache_groups[idx].kv_cache_spec
+            sw = get_sliding_window_size_in_chunks(
+                kv_spec, tokens_per_block * spec.blocks_per_chunk
+            )
+            if sw is None:
+                full_attn_tokens_per_chunk.add(tokens_per_block * spec.blocks_per_chunk)""",
+    ),
+    # 4) from_spec emit loop: emit scratch entries untouched by window logic
+    (
+        """        kv_group_configs_list: list[GroupOffloadConfig] = []
+        for idx, tokens_per_block in enumerate(spec.tokens_per_block):
+            kv_cache_group = kv_cache_config.kv_cache_groups[idx]
+            kv_spec = kv_cache_group.kv_cache_spec
+            sw = get_sliding_window_size_in_chunks(""",
+        """        kv_group_configs_list: list[GroupOffloadConfig] = []
+        for idx, tokens_per_block in enumerate(spec.tokens_per_block):
+            kv_cache_group = kv_cache_config.kv_cache_groups[idx]
+            kv_spec = kv_cache_group.kv_cache_spec
+"""
+        + SCRATCH_TEST
+        + """
+                # [fn-kv-offload] per-request scratch group: no stores,
+                # loads, or lookups; hashes_per_chunk is never consumed
+                # (update_offload_keys skips scratch groups).
+                kv_group_configs_list.append(
+                    GroupOffloadConfig(
+                        group_idx=idx,
+                        tokens_per_block=tokens_per_block,
+                        tokens_per_chunk=tokens_per_block * spec.blocks_per_chunk,
+                        hashes_per_chunk=1,
+                        sliding_window_size_in_chunks=None,
+                        alignment_chunk_count=None,
+                        kv_event_group_spec=get_offloading_event_group_spec(
+                            kv_cache_group
+                        ),
+                        is_eagle_group=False,
+                        is_scratch=True,
+                    )
+                )
+                continue
+            sw = get_sliding_window_size_in_chunks(""",
+    ),
+    # 5) ctor lookup-group lists: skip scratch
+    (
+        """        full_attention_groups: list[int] = []
+        sliding_window_groups: list[int] = []
+        for group_config in self.config.kv_group_configs:
+            if group_config.sliding_window_size_in_chunks is None:
+                full_attention_groups.append(group_config.group_idx)
+            else:
+                sliding_window_groups.append(group_config.group_idx)""",
+        """        full_attention_groups: list[int] = []
+        sliding_window_groups: list[int] = []
+        for group_config in self.config.kv_group_configs:
+            if group_config.is_scratch:  # [fn-kv-offload]
+                continue
+            if group_config.sliding_window_size_in_chunks is None:
+                full_attention_groups.append(group_config.group_idx)
+            else:
+                sliding_window_groups.append(group_config.group_idx)""",
+    ),
+    # 6) update_offload_keys: scratch never gains keys
+    (
+        """    def update_offload_keys(self) -> None:
+        for group_config, group_state in zip(
+            self.config.kv_group_configs, self.group_states
+        ):
+            for req_block_hash in islice(""",
+        """    def update_offload_keys(self) -> None:
+        for group_config, group_state in zip(
+            self.config.kv_group_configs, self.group_states
+        ):
+            if group_config.is_scratch:  # [fn-kv-offload]
+                continue
+            for req_block_hash in islice(""",
+    ),
+    # 7) storable_chunks: zero for scratch
+    (
+        """        num_chunks = num_offloadable_tokens // group_config.tokens_per_chunk
+        is_decoding = num_offloadable_tokens > self.req.num_prompt_tokens""",
+        """        if group_config.is_scratch:  # [fn-kv-offload]
+            return 0
+        num_chunks = num_offloadable_tokens // group_config.tokens_per_chunk
+        is_decoding = num_offloadable_tokens > self.req.num_prompt_tokens""",
+    ),
+    # 8) update_num_hit_chunks: scratch never registers hits
+    (
+        """    def update_num_hit_chunks(self, num_cached_tokens: int) -> None:
+        for group_config, group_state in zip(
+            self.config.kv_group_configs, self.group_states
+        ):
+            group_state.num_hit_chunks = (
+                num_cached_tokens // group_config.tokens_per_chunk
+            )""",
+        """    def update_num_hit_chunks(self, num_cached_tokens: int) -> None:
+        for group_config, group_state in zip(
+            self.config.kv_group_configs, self.group_states
+        ):
+            if group_config.is_scratch:  # [fn-kv-offload]
+                continue
+            group_state.num_hit_chunks = (
+                num_cached_tokens // group_config.tokens_per_chunk
+            )""",
+    ),
+    # 9) _touch: scratch never touched
+    (
+        """    def _touch(self, req_status: RequestOffloadState):
+        for group_config, group_state in zip(
+            self.config.kv_group_configs, req_status.group_states
+        ):
+            if group_config.sliding_window_size_in_chunks is None:""",
+        """    def _touch(self, req_status: RequestOffloadState):
+        for group_config, group_state in zip(
+            self.config.kv_group_configs, req_status.group_states
+        ):
+            if group_config.is_scratch:  # [fn-kv-offload]
+                continue
+            if group_config.sliding_window_size_in_chunks is None:""",
+    ),
+    # 10) load-build group loop: zero contribution
+    (
+        """            self._current_batch_allocated_block_ids.update(
+                block.block_id for block in group_blocks if block.block_id != 0
+            )
 
-try:
-    ast.parse(src)
-except SyntaxError as exc:
-    sys.exit(f"config.py: patched output does not parse: {exc}")
+            tokens_per_block = group_config.tokens_per_block""",
+        """            self._current_batch_allocated_block_ids.update(
+                block.block_id for block in group_blocks if block.block_id != 0
+            )
 
-open(OUT, "w").write(src)
-print("patched kvoffload/config_patched.py")
+            if group_config.is_scratch:  # [fn-kv-offload]
+                group_sizes.append(0)
+                block_indices.append(0)
+                continue
+
+            tokens_per_block = group_config.tokens_per_block""",
+    ),
+    # 11) _build_store_jobs key-collection: skip scratch
+    (
+        """            for group_config, group_state in zip(
+                self.config.kv_group_configs, req_status.group_states
+            ):
+                num_chunks = req_status.storable_chunks(
+                    group_config, group_state, num_offloadable_tokens
+                )""",
+        """            for group_config, group_state in zip(
+                self.config.kv_group_configs, req_status.group_states
+            ):
+                if group_config.is_scratch:  # [fn-kv-offload]
+                    continue
+                num_chunks = req_status.storable_chunks(
+                    group_config, group_state, num_offloadable_tokens
+                )""",
+    ),
+    # 12) _build_store_jobs src-block loop: zero contribution
+    (
+        """            for group_config, group_state in zip(
+                self.config.kv_group_configs, req_status.group_states
+            ):
+                is_sliding_window = (
+                    group_config.sliding_window_size_in_chunks is not None
+                )""",
+        """            for group_config, group_state in zip(
+                self.config.kv_group_configs, req_status.group_states
+            ):
+                if group_config.is_scratch:  # [fn-kv-offload]
+                    group_sizes.append(0)
+                    block_indices.append(0)
+                    continue
+                is_sliding_window = (
+                    group_config.sliding_window_size_in_chunks is not None
+                )""",
+    ),
+]
+
+apply(
+    os.path.join(HERE, "kvoffload", "orig", "config.py"),
+    os.path.join(HERE, "kvoffload", "config_patched.py"),
+    cfg_edits,
+)
+apply(
+    os.path.join(HERE, "kvoffload", "orig", "scheduler.py"),
+    os.path.join(HERE, "kvoffload", "scheduler_patched.py"),
+    sch_edits,
+)
