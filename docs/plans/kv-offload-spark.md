@@ -1,29 +1,35 @@
 # KV-cache offload for the Spark kits — implementation plan (2026-09-20)
 
-## Current state (2026-09-21, boot23)
+## Current state (2026-09-21, boot26)
 
-Arm + store work; the restore gate is still closed, root cause now proven.
-Boot23's per-group scan diagnostics: group 0 (attention) hits all 72 chunks;
-group 2 (first mamba group) misses at chunk 0 and the scan's maximal-prefix
-rule kills the whole request. Disk audit: 18 of A's 72 chunks have NO mamba
-state files (g0-only rows), always the same chunk indices (every 4th —
-the per-scheduler-step granularity), and flood re-stores skip existing
-files so they stay missing forever.
+**Restore gate GREEN.** Restore of a parked 118,144-token prefix: 4.3 s,
+1.83 GB read off NVMe, generation bit-exact against the reference
+(marker_text_match=true). Was 44.8-46.5 s of full re-prefill every time —
+the 10× the tier exists for.
 
-Mechanism: MambaManager align mode keeps a position-indexed row whose
-intermediate positions are null placeholders (states materialize only at the
-running tail, freed as the boundary moves); the offload store pass skips
-`block_id == 0`, so those chunks never write a file. The restore scan
-requires an unbroken per-group hit run from chunk 0, so one missing mamba
-file zeroes every request sharing the prefix — every flood pays a full
-120k re-prefill (~46 s) instead of a ~5-10 s load.
+Root cause of the closed gate, proven with boot24-26 row diagnostics: the
+align-mode mamba row materializes state blocks only at the running tail;
+the row's first 3 positions are null placeholders forever, so the offload
+store pass skips them (chunks 0,1,2 of every row never store — `ext g2
++7 zeros=3` then `store-skip g2 chunk=0/1/2`, exactly once per group).
+The upstream per-chunk maximal-prefix scan semantics can therefore never
+hold for mamba groups: the scan died at chunk 0 and complete_hit
+collapsed to 0 for every request sharing a parked prefix.
 
-Fix (designed, next): in our scheduler overlay, give align-mode mamba
-groups boundary-only scan semantics (hit = state file at the resume
-boundary; tighten to the largest boundary that has one) and store only
-step-end boundary chunks (intermediate mamba files are never read back).
-Verify the row-tail position↔chunk mapping with one log line per step
-before trusting the store path.
+Fix (dd3eb68): requires_cow_source groups scan boundary-only — the state
+serving a resume at boundary B lives in the file stored for chunk
+B/tpc - 1; search downward from the ceiling for the largest boundary
+with a file, composing with the eagle tail pop (R = i+2 unverified,
+i+1 verified). The engine cooperates: the align row pre-places a real
+block at the hit boundary (`loadpath g2 nlp=70 pend=1 null_dst=0`), so
+the load fetches exactly one boundary state per mamba group into a real
+dst and the resume is bit-exact.
+
+Decode parity battery (24 rows, connector on, full pool, GMU 0.78): no
+collapse, zero NV errors, MTP accept unchanged; per-stream decode 3-9%
+under the ple-nvme-78b baseline on code, 10-20% on prose — the arm's
+price for the 10× restore. Remaining before wider ship: diagnostics
+demotion (the ext/store-skip/loadpath lines are loud).
 
 ## Original plan
 
