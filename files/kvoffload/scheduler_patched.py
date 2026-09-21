@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import time
 from collections.abc import Iterable, Sequence
+
+_FNKV_QUIET = os.environ.get("KV_OFFLOAD_QUIET_LOOKUP")
 from dataclasses import dataclass, field
 from itertools import chain, islice
 from typing import Any, NamedTuple
@@ -418,7 +421,16 @@ class RequestOffloadState:
             return
 
         assert len(new_block_id_groups) == len(self.group_states)
-        for group_state, new_blocks in zip(self.group_states, new_block_id_groups):
+        for _gi, (group_state, new_blocks) in enumerate(
+            zip(self.group_states, new_block_id_groups)
+        ):
+            if new_blocks:
+                _zeros = sum(1 for _b in new_blocks if _b == 0)
+                logger.info(
+                    "[fn-kv-offload] ext g%d +%d zeros=%d reals=%d len=%d",
+                    _gi, len(new_blocks), _zeros,
+                    len(new_blocks) - _zeros, len(group_state.block_ids),
+                )
             group_state.block_ids.extend(new_blocks)
 
     def storable_chunks(
@@ -800,6 +812,12 @@ class OffloadingConnectorScheduler:
                 )
                 if max_hit_size_tokens - num_computed_tokens < tokens_per_chunk:
                     # We can only load less than a chunk, so skip.
+                    logger.info(
+                        "[fn-kv-offload] group %d early-return: max_hit=%d"
+                        " computed=%d tpc=%d keys=%d",
+                        group_idx, max_hit_size_tokens, num_computed_tokens,
+                        tokens_per_chunk, len(offload_keys),
+                    )
                     return 0
 
                 sliding_window_size_in_chunks = (
@@ -823,13 +841,37 @@ class OffloadingConnectorScheduler:
                 # have backend-confirmed hits
                 num_hit_chunks: int | None
                 if sliding_window_size_in_chunks is None:
-                    num_hit_chunks = self._maximal_prefix_lookup(
-                        offload_keys,
-                        req_status.req_context,
-                        req_status.req,
-                        group_config,
-                        start_chunk_idx,
-                    )
+                    if group_config.requires_cow_source:
+                        # [fn-kv-offload] boundary-only scan for align mamba
+                        _top = len(offload_keys) - 1
+                        num_hit_chunks = 0
+                        for _i in range(_top, -1, -1):
+                            _res = self.manager.lookup(
+                                offload_keys[_i], req_status.req_context
+                            )
+                            if _res is LookupResult.MISS:
+                                continue
+                            if _res is LookupResult.RETRY:
+                                defer_lookup = True
+                                continue
+                            num_hit_chunks = (
+                                _i + 2 if is_eagle_unverified else _i + 1
+                            )
+                            break
+                        logger.info(
+                            "[fn-kv-offload] mamba-boundary g%d start=%d"
+                            " top=%d -> R=%d",
+                            group_config.group_idx, start_chunk_idx, _top,
+                            num_hit_chunks,
+                        )
+                    else:
+                        num_hit_chunks = self._maximal_prefix_lookup(
+                            offload_keys,
+                            req_status.req_context,
+                            req_status.req,
+                            group_config,
+                            start_chunk_idx,
+                        )
                 else:
                     required_window = sliding_window_size_in_chunks
                     if is_eagle_unverified:
@@ -838,6 +880,14 @@ class OffloadingConnectorScheduler:
                         offload_keys,
                         required_window,
                         req_status.req_context,
+                    )
+                if not _FNKV_QUIET:
+                    logger.info(
+                        "[fn-kv-offload] group %d (tpc=%d keys=%d"
+                        " window=%s eagle=%s) -> chunks=%s",
+                        group_idx, tokens_per_chunk, len(offload_keys),
+                        group_config.sliding_window_size_in_chunks,
+                        group_config.is_eagle_group, num_hit_chunks,
                     )
                 if num_hit_chunks == 0:
                     return 0
@@ -1131,11 +1181,29 @@ class OffloadingConnectorScheduler:
                         )
                     )
 
+            _dst_range = group_blocks[
+                num_locally_computed_gpu_blocks:num_gpu_blocks
+            ]
+            _dst_nulls = sum(1 for _b in _dst_range if _b.block_id == 0)
+            _row_reals = (
+                [
+                    (_j, _b.block_id)
+                    for _j, _b in enumerate(group_blocks)
+                    if _b.block_id != 0
+                ]
+                if group_config.requires_cow_source
+                else None
+            )
+            logger.info(
+                "[fn-kv-offload] loadpath g%d nlp=%d ngb=%d pend=%d"
+                " null_dst=%d row_reals=%s",
+                group_config.group_idx, num_locally_computed_gpu_blocks,
+                num_gpu_blocks, num_pending_gpu_blocks, _dst_nulls,
+                _row_reals,
+            )
             dst_block_ids.extend(
                 block.block_id
-                for block in group_blocks[
-                    num_locally_computed_gpu_blocks:num_gpu_blocks
-                ]
+                for block in _dst_range
             )
             group_sizes.append(num_pending_gpu_blocks)
             block_indices.append(num_locally_computed_gpu_blocks)
@@ -1375,6 +1443,11 @@ class OffloadingConnectorScheduler:
                     zip(offload_keys, offload_block_ids)
                 ):
                     if block_id == 0:
+                        logger.info(
+                            "[fn-kv-offload] store-skip g%d chunk=%d",
+                            group_config.group_idx,
+                            start_chunk_idx + key_idx,
+                        )
                         continue
                     # Skip SWA chunks that can never serve a load hit:
                     # within each full-attention alignment segment, only the

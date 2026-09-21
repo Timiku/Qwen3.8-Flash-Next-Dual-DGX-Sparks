@@ -1,5 +1,32 @@
 # KV-cache offload for the Spark kits — implementation plan (2026-09-20)
 
+## Current state (2026-09-21, boot23)
+
+Arm + store work; the restore gate is still closed, root cause now proven.
+Boot23's per-group scan diagnostics: group 0 (attention) hits all 72 chunks;
+group 2 (first mamba group) misses at chunk 0 and the scan's maximal-prefix
+rule kills the whole request. Disk audit: 18 of A's 72 chunks have NO mamba
+state files (g0-only rows), always the same chunk indices (every 4th —
+the per-scheduler-step granularity), and flood re-stores skip existing
+files so they stay missing forever.
+
+Mechanism: MambaManager align mode keeps a position-indexed row whose
+intermediate positions are null placeholders (states materialize only at the
+running tail, freed as the boundary moves); the offload store pass skips
+`block_id == 0`, so those chunks never write a file. The restore scan
+requires an unbroken per-group hit run from chunk 0, so one missing mamba
+file zeroes every request sharing the prefix — every flood pays a full
+120k re-prefill (~46 s) instead of a ~5-10 s load.
+
+Fix (designed, next): in our scheduler overlay, give align-mode mamba
+groups boundary-only scan semantics (hit = state file at the resume
+boundary; tighten to the largest boundary that has one) and store only
+step-end boundary chunks (intermediate mamba files are never read back).
+Verify the row-tail position↔chunk mapping with one log line per step
+before trusting the store path.
+
+## Original plan
+
 Goal: park evicted sessions' KV on NVMe so a returning session restores in
 seconds instead of re-prefilling, and survives a restart. GLM lane precedent:
 MiaAI-Lab/GLM-5.3 PR #58 (+ the #230/#232 stack, our `nvme_direct2`), issue
