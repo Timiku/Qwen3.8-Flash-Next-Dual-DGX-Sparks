@@ -111,6 +111,18 @@ KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"   # fp8 needs files/patch_qsa_fp8_kv.py,
 # vLLM pick a smaller attention block. Empty keeps the checkpoint's float32.
 MAMBA_SSM_CACHE_DTYPE="${MAMBA_SSM_CACHE_DTYPE:-}"
 PLE_OFFLOAD="${PLE_OFFLOAD:-false}"
+# KV-cache offload to NVMe (parking tier for sessions past the KV pool).
+# Adds --kv-transfer-config with the out-of-tree nvme-direct spec
+# (files/kvoffload/nvme_direct2.py): per-block files under a model-fenced
+# namespace on each node's OWN NVMe (never the NFS weights share). Restore
+# reads the file instead of re-prefilling; cross-boot keys need
+# PYTHONHASHSEED=0, which the arm sets. See docs/plans/kv-offload-spark.md.
+KV_OFFLOAD="${KV_OFFLOAD:-false}"
+KV_ROOT="${KV_ROOT:-$HOME/fn-kv}"                 # head-side store root
+KV_ROOT_WORKER="${KV_ROOT_WORKER:-$REMOTE_HOME/fn-kv}"
+KV_CAPACITY_GIB="${KV_CAPACITY_GIB:-500}"         # disk-free sanity floor
+KV_IO_THREADS="${KV_IO_THREADS:-6}"               # per-process NVMe io threads
+KV_PROMPT_ONLY="${KV_PROMPT_ONLY:-false}"         # false = persist generated turns too
 # Vision MLP intermediate_size=4304 is not divisible by 16 after TP split (4304/2=2152).
 # NVFP4 kernels require input features % 16 == 0, so replicate the encoder on each GPU.
 MM_ENCODER_TP_MODE="${MM_ENCODER_TP_MODE:-data}"
@@ -924,6 +936,84 @@ if $DO_LAUNCH; then
     fi
 
     # ---------------------------------------------------------------------------
+    # 6d. KV-cache offload to NVMe (optional; KV_OFFLOAD=true).
+    #     Parks evicted sessions' KV as per-block files under a model-fenced
+    #     namespace on each node's OWN NVMe (never the NFS weights share — the
+    #     PLE table rule). An out-of-tree spec (files/kvoffload/nvme_direct2.py,
+    #     Apache-2.0, ported from the GLM-5.3 kit's qualified lane) rides the
+    #     image's OffloadingConnector via PYTHONPATH — no vLLM source edits.
+    #     Restore reads files; a wrong-model/wrong-revision boot lands in a
+    #     DIFFERENT namespace (fail-closed sidecar), never on someone else's
+    #     bytes. Cross-boot key stability REQUIRES PYTHONHASHSEED=0 (block-hash
+    #     chain root is otherwise os.urandom), set on both nodes here.
+    # ---------------------------------------------------------------------------
+    KV_HEAD_MOUNTS=""; KV_WORKER_MOUNTS=""; KV_ENV=""
+    if [[ "$KV_OFFLOAD" == "true" ]]; then
+        info "=== Step 6d: KV-cache offload (NVMe-direct) ==="
+        case "$EXTRA_VLLM_ARGS" in
+            *--kv-transfer-config*)
+                err "KV_OFFLOAD=true and an EXTRA_VLLM_ARGS --kv-transfer-config conflict - pick one." ;;
+        esac
+        KV_SPEC_HOST="$SCRIPT_DIR/files/kvoffload/nvme_direct2.py"
+        [[ -f "$KV_SPEC_HOST" ]] || err "missing $KV_SPEC_HOST"
+        KV_CAPACITY=$(( KV_CAPACITY_GIB * 1024 * 1024 * 1024 ))
+        mkdir -p "$KV_ROOT" || err "cannot create $KV_ROOT"
+        _fst=$(stat -f -c %T "$KV_ROOT" 2>/dev/null || echo unknown)
+        case "$_fst" in
+            tmpfs|ramfs) err "KV_ROOT=$KV_ROOT lives on $_fst - point it at the NVMe volume." ;;
+        esac
+        _av=$(df -B1 --output=avail "$KV_ROOT" | awk 'NF && $1 ~ /^[0-9]+$/ {v=$1} END{print v+0}')
+        (( _av >= KV_CAPACITY )) || err "head: KV_ROOT has ${_av:-?} B free; capacity=${KV_CAPACITY} B"
+        ssh_worker "mkdir -p '$KV_ROOT_WORKER'" || err "cannot create $KV_ROOT_WORKER on worker"
+        _av=$(ssh_worker "df -B1 --output=avail '$KV_ROOT_WORKER'" | awk 'NF && $1 ~ /^[0-9]+$/ {v=$1} END{print v+0}')
+        (( _av >= KV_CAPACITY )) || err "worker: KV_ROOT_WORKER has ${_av:-?} B free; capacity=${KV_CAPACITY} B"
+        # The mount of a file creates /opt/fnkv/kvoffload/ in the container;
+        # PYTHONPATH=/opt/fnkv then makes kvoffload.nvme_direct2 importable
+        # as a namespace package (same shape as the GLM kit's lane). Head
+        # mounts in place; worker gets a copy staged to /tmp.
+        ssh_worker "rm -f /tmp/fnkv-nvme_direct2.py"
+        scp -q "$KV_SPEC_HOST" "${WORKER_USER:+${WORKER_USER}@}${WORKER_IP}:/tmp/fnkv-nvme_direct2.py" \
+            || err "failed to stage nvme_direct2.py on worker"
+        KV_HEAD_MOUNTS="-v $KV_SPEC_HOST:/opt/fnkv/kvoffload/nvme_direct2.py:ro -v $KV_ROOT:/mnt/fn-kv"
+        KV_WORKER_MOUNTS="-v /tmp/fnkv-nvme_direct2.py:/opt/fnkv/kvoffload/nvme_direct2.py:ro -v $KV_ROOT_WORKER:/mnt/fn-kv"
+        KV_ENV="-e PYTHONHASHSEED=0 -e PYTHONPATH=/opt/fnkv"
+        # Overlay generators (house pattern: extract orig from image once,
+        # regenerate from it every launch, fail loud on anchor drift).
+        #  - offloading/config.py: assert -> classified receipt (insurance;
+        #    our geometry is aligned, see the generator docstring).
+        #  - mamba_hybrid.py + scheduler.py: the blazux align-mode block-size
+        #    fix — REQUIRED for correct restore-on-hit of the hybrid state
+        #    (port of patch_mamba_block_size.py, Apache-2.0).
+        KVCFG="$VLLM_PKG/distributed/kv_transfer/kv_connector/v1/offloading/config.py"
+        MHYB="$VLLM_PKG/v1/worker/gpu/model_states/mamba_hybrid.py"
+        SCHD="$VLLM_PKG/v1/core/sched/scheduler.py"
+        mkdir -p "$SCRIPT_DIR/files/kvoffload/orig" "$SCRIPT_DIR/files/kv/orig"
+        extract_from_image "$KVCFG" "$SCRIPT_DIR/files/kvoffload/orig/config.py"
+        extract_from_image "$MHYB" "$SCRIPT_DIR/files/kv/orig/mamba_hybrid.py"
+        extract_from_image "$SCHD" "$SCRIPT_DIR/files/kv/orig/scheduler.py"
+        if [[ "${KV_SKIP_GROUPS_PATCH:-0}" != "1" ]]; then
+            python3 "$SCRIPT_DIR/files/patch_kv_offload_groups.py" || err "kv groups patch failed"
+            add_overlay "$SCRIPT_DIR/files/kvoffload/config_patched.py" "$KVCFG"
+        fi
+        if [[ "${KV_SKIP_MAMBA_FIX:-0}" != "1" ]]; then
+            python3 "$SCRIPT_DIR/files/patch_mamba_block_size.py" || err "mamba block-size patch failed"
+            add_overlay "$SCRIPT_DIR/files/kv/mamba_hybrid.py" "$MHYB"
+            add_overlay "$SCRIPT_DIR/files/kv/scheduler.py" "$SCHD"
+        else
+            warn "KV_SKIP_MAMBA_FIX=1 — align-mode state seeding stays BUGGY"
+            warn "     (prefix hits can restore an all-zero mamba state). Only"
+            warn "     for A/B experiments; never ship with it."
+        fi
+        _KVT_PROMPT_ONLY=true; [[ "$KV_PROMPT_ONLY" == "false" ]] && _KVT_PROMPT_ONLY=false
+        # Compact JSON (no spaces) wrapped in LITERAL single quotes: the
+        # rendered launch scripts expand $VLLM_ARGS_STR as source, and the
+        # quotes keep bash brace-expansion out of the commas (same pattern as
+        # --speculative-config above).
+        KV_XFER_JSON="'{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"spec_name\":\"NvmeDirectOffloadingSpec2\",\"spec_module_path\":\"kvoffload.nvme_direct2\",\"root_dir\":\"/mnt/fn-kv\",\"model_name\":\"${MODEL_ID}\",\"model_revision\":\"${SNAP}\",\"capacity_bytes\":${KV_CAPACITY},\"n_io_threads\":${KV_IO_THREADS},\"offload_prompt_only\":${_KVT_PROMPT_ONLY}}}'"
+        ok "KV offload ON: root=$KV_ROOT (worker $KV_ROOT_WORKER), cap=${KV_CAPACITY_GIB} GiB, prompt_only=${_KVT_PROMPT_ONLY}"
+    fi
+
+    # ---------------------------------------------------------------------------
     # 7. Build vLLM args (shared between head and worker)
     # ---------------------------------------------------------------------------
     info "=== Step 7: Launch vLLM ==="
@@ -1054,6 +1144,11 @@ print(json.dumps({"text_config": tc}, separators=(",", ":")) if tc else "")
     # quotes exactly as you would on a shell command line).
     if [[ -n "$EXTRA_VLLM_ARGS" ]]; then
         VLLM_ARGS+=("$EXTRA_VLLM_ARGS")
+    fi
+    # KV offload: the connector config rides VLLM_ARGS so both nodes' launch
+    # scripts carry it (the JSON already wears its literal single quotes).
+    if [[ "$KV_OFFLOAD" == "true" ]]; then
+        VLLM_ARGS+=("--kv-transfer-config" "$KV_XFER_JSON")
     fi
     # One rendered string shared by the worker and head launch scripts. JSON
     # values already carry their own single quotes (see printf above).
@@ -1206,10 +1301,12 @@ docker run \
     -e VLLM_HOST_IP=$WORKER_IP \
     ${VLLM_ALLOW_LONG_MAX_MODEL_LEN:+-e VLLM_ALLOW_LONG_MAX_MODEL_LEN=$VLLM_ALLOW_LONG_MAX_MODEL_LEN} \
     $PLE_OFFLOAD_ENV \
+    $KV_ENV \
     -e HF_HOME=/root/.cache/huggingface \
     $WORKER_PLE_MOUNT \
     $WORKER_MODELOPT_MOUNT \
     $WORKER_OVERLAY_MOUNTS \
+    $KV_WORKER_MOUNTS \
     $OVERLAY_ENV_STR \
     $WORKER_HF_MOUNT \
     -v $REMOTE_HOME/.cache/vllm:/root/.cache/vllm \
@@ -1281,11 +1378,12 @@ docker run \
     -e VLLM_HOST_IP=$HEAD_IP \
     ${VLLM_ALLOW_LONG_MAX_MODEL_LEN:+-e VLLM_ALLOW_LONG_MAX_MODEL_LEN=$VLLM_ALLOW_LONG_MAX_MODEL_LEN} \
     $PLE_OFFLOAD_ENV \
+    $KV_ENV \
     -e HF_HOME=/root/.cache/huggingface \
     $HEAD_PLE_MOUNT \
     $HEAD_MODELOPT_MOUNT \
     $HEAD_OVERLAY_MOUNTS \
-    $OVERLAY_ENV_STR \
+    $KV_HEAD_MOUNTS \
     -v $HF_CACHE_DIR:/root/.cache/huggingface \
     -v $HOME/.cache/vllm:/root/.cache/vllm \
     $IMAGE \

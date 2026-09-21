@@ -47,6 +47,11 @@ files/qsa_ops_patched.py
 files/qsa_nvidia_patched.py
 files/overlay/*.py
 files/qsa_gb10/qsa.py
+# KV-offload lane outputs (regenerated every launch; sources are the
+# generators + the tracked files/kvoffload/nvme_direct2.py spec).
+files/kvoffload/config_patched.py
+files/kv/mamba_hybrid.py
+files/kv/scheduler.py
 
 # Draft vocabularies are built from a corpus (files/build_draft_vocab.py);
 # see README "Reduced-vocabulary MTP drafting".
