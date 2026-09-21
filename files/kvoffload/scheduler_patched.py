@@ -4,7 +4,11 @@ import os
 import time
 from collections.abc import Iterable, Sequence
 
-_FNKV_QUIET = os.environ.get("KV_OFFLOAD_QUIET_LOOKUP")
+# [fn-kv-offload] hot-path diagnostics are silent unless KV_OFFLOAD_DEBUG is
+# set. Measured 09-21: the ungated per-step lines (store-skip alone) ran
+# ~1200 lines/s through the logging stack = 6-12 ms of every 64-90 ms step.
+# Boot-time receipts (group geometry, eagle detection) stay unconditional.
+_FNKV_DEBUG = bool(os.environ.get("KV_OFFLOAD_DEBUG"))
 from dataclasses import dataclass, field
 from itertools import chain, islice
 from typing import Any, NamedTuple
@@ -425,12 +429,13 @@ class RequestOffloadState:
             zip(self.group_states, new_block_id_groups)
         ):
             if new_blocks:
-                _zeros = sum(1 for _b in new_blocks if _b == 0)
-                logger.info(
-                    "[fn-kv-offload] ext g%d +%d zeros=%d reals=%d len=%d",
-                    _gi, len(new_blocks), _zeros,
-                    len(new_blocks) - _zeros, len(group_state.block_ids),
-                )
+                if _FNKV_DEBUG:
+                    _zeros = sum(1 for _b in new_blocks if _b == 0)
+                    logger.info(
+                        "[fn-kv-offload] ext g%d +%d zeros=%d reals=%d len=%d",
+                        _gi, len(new_blocks), _zeros,
+                        len(new_blocks) - _zeros, len(group_state.block_ids),
+                    )
             group_state.block_ids.extend(new_blocks)
 
     def storable_chunks(
@@ -812,12 +817,13 @@ class OffloadingConnectorScheduler:
                 )
                 if max_hit_size_tokens - num_computed_tokens < tokens_per_chunk:
                     # We can only load less than a chunk, so skip.
-                    logger.info(
-                        "[fn-kv-offload] group %d early-return: max_hit=%d"
-                        " computed=%d tpc=%d keys=%d",
-                        group_idx, max_hit_size_tokens, num_computed_tokens,
-                        tokens_per_chunk, len(offload_keys),
-                    )
+                    if _FNKV_DEBUG:
+                        logger.info(
+                            "[fn-kv-offload] group %d early-return: max_hit=%d"
+                            " computed=%d tpc=%d keys=%d",
+                            group_idx, max_hit_size_tokens, num_computed_tokens,
+                            tokens_per_chunk, len(offload_keys),
+                        )
                     return 0
 
                 sliding_window_size_in_chunks = (
@@ -858,12 +864,13 @@ class OffloadingConnectorScheduler:
                                 _i + 2 if is_eagle_unverified else _i + 1
                             )
                             break
-                        logger.info(
-                            "[fn-kv-offload] mamba-boundary g%d start=%d"
-                            " top=%d -> R=%d",
-                            group_config.group_idx, start_chunk_idx, _top,
-                            num_hit_chunks,
-                        )
+                        if _FNKV_DEBUG:
+                            logger.info(
+                                "[fn-kv-offload] mamba-boundary g%d start=%d"
+                                " top=%d -> R=%d",
+                                group_config.group_idx, start_chunk_idx, _top,
+                                num_hit_chunks,
+                            )
                     else:
                         num_hit_chunks = self._maximal_prefix_lookup(
                             offload_keys,
@@ -881,7 +888,7 @@ class OffloadingConnectorScheduler:
                         required_window,
                         req_status.req_context,
                     )
-                if not _FNKV_QUIET:
+                if _FNKV_DEBUG:
                     logger.info(
                         "[fn-kv-offload] group %d (tpc=%d keys=%d"
                         " window=%s eagle=%s) -> chunks=%s",
@@ -975,11 +982,12 @@ class OffloadingConnectorScheduler:
 
     def _lookup(self, req_status: RequestOffloadState) -> int | None:
         complete_hit = self._lookup_complete_chunks(req_status)
-        logger.info(
-            "[fn-kv-offload] scan req=%s complete_hit=%s partial_tail_ok=%s",
-            req_status.req.request_id, complete_hit,
-            self.config.supports_partial_tail,
-        )
+        if _FNKV_DEBUG:
+            logger.info(
+                "[fn-kv-offload] scan req=%s complete_hit=%s partial_tail_ok=%s",
+                req_status.req.request_id, complete_hit,
+                self.config.supports_partial_tail,
+            )
         req_status.partial_tail_boundary = None
         if complete_hit is None or not self.config.supports_partial_tail:
             return complete_hit
@@ -1063,13 +1071,14 @@ class OffloadingConnectorScheduler:
         req_status = self._req_status[request.request_id]
         for group_state in req_status.group_states:
             group_state.block_ids.clear()
-        logger.info(
-            "[fn-kv-offload] lookup req=%s computed=%d hashes=%d"
-            " lookup_groups=%d skip_read=%s jobs=%d",
-            request.request_id, num_computed_tokens,
-            len(request.block_hashes), len(self._lookup_groups),
-            request.skip_reading_prefix_cache, len(req_status.transfer_jobs),
-        )
+        if _FNKV_DEBUG:
+            logger.info(
+                "[fn-kv-offload] lookup req=%s computed=%d hashes=%d"
+                " lookup_groups=%d skip_read=%s jobs=%d",
+                request.request_id, num_computed_tokens,
+                len(request.block_hashes), len(self._lookup_groups),
+                request.skip_reading_prefix_cache, len(req_status.transfer_jobs),
+            )
 
         if req_status.transfer_jobs:
             logger.debug(
@@ -1100,10 +1109,11 @@ class OffloadingConnectorScheduler:
 
         self._touch(req_status)
 
-        logger.info(
-            "[fn-kv-offload] verdict req=%s hit=%s async=%s",
-            request.request_id, num_hit_tokens, bool(num_hit_tokens),
-        )
+        if _FNKV_DEBUG:
+            logger.info(
+                "[fn-kv-offload] verdict req=%s hit=%s async=%s",
+                request.request_id, num_hit_tokens, bool(num_hit_tokens),
+            )
         return num_hit_tokens, bool(num_hit_tokens)
 
     def update_state_after_alloc(
@@ -1181,26 +1191,31 @@ class OffloadingConnectorScheduler:
                         )
                     )
 
-            _dst_range = group_blocks[
-                num_locally_computed_gpu_blocks:num_gpu_blocks
-            ]
-            _dst_nulls = sum(1 for _b in _dst_range if _b.block_id == 0)
-            _row_reals = (
-                [
-                    (_j, _b.block_id)
-                    for _j, _b in enumerate(group_blocks)
-                    if _b.block_id != 0
+            if _FNKV_DEBUG:
+                _dst_range = group_blocks[
+                    num_locally_computed_gpu_blocks:num_gpu_blocks
                 ]
-                if group_config.requires_cow_source
-                else None
-            )
-            logger.info(
-                "[fn-kv-offload] loadpath g%d nlp=%d ngb=%d pend=%d"
-                " null_dst=%d row_reals=%s",
-                group_config.group_idx, num_locally_computed_gpu_blocks,
-                num_gpu_blocks, num_pending_gpu_blocks, _dst_nulls,
-                _row_reals,
-            )
+                _dst_nulls = sum(1 for _b in _dst_range if _b.block_id == 0)
+                _row_reals = (
+                    [
+                        (_j, _b.block_id)
+                        for _j, _b in enumerate(group_blocks)
+                        if _b.block_id != 0
+                    ]
+                    if group_config.requires_cow_source
+                    else None
+                )
+                logger.info(
+                    "[fn-kv-offload] loadpath g%d nlp=%d ngb=%d pend=%d"
+                    " null_dst=%d row_reals=%s",
+                    group_config.group_idx, num_locally_computed_gpu_blocks,
+                    num_gpu_blocks, num_pending_gpu_blocks, _dst_nulls,
+                    _row_reals,
+                )
+            else:
+                _dst_range = group_blocks[
+                    num_locally_computed_gpu_blocks:num_gpu_blocks
+                ]
             dst_block_ids.extend(
                 block.block_id
                 for block in _dst_range
@@ -1439,15 +1454,23 @@ class OffloadingConnectorScheduler:
                 ]
                 assert len(offload_keys) == len(offload_block_ids)
 
+                if not any(offload_block_ids):
+                    # [fn-kv-offload] all-null window: align-mamba rows keep
+                    # null placeholders for chunks that never store; skip the
+                    # group at C speed instead of walking it every step
+                    # (measured 09-21: 4 groups x ~73 chunks re-walked per
+                    # step per request fed the store-skip log flood).
+                    continue
                 for key_idx, (offload_key, block_id) in enumerate(
                     zip(offload_keys, offload_block_ids)
                 ):
                     if block_id == 0:
-                        logger.info(
-                            "[fn-kv-offload] store-skip g%d chunk=%d",
-                            group_config.group_idx,
-                            start_chunk_idx + key_idx,
-                        )
+                        if _FNKV_DEBUG:
+                            logger.info(
+                                "[fn-kv-offload] store-skip g%d chunk=%d",
+                                group_config.group_idx,
+                                start_chunk_idx + key_idx,
+                            )
                         continue
                     # Skip SWA chunks that can never serve a load hit:
                     # within each full-attention alignment segment, only the

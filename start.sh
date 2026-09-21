@@ -123,6 +123,10 @@ KV_ROOT_WORKER="${KV_ROOT_WORKER:-}"              # empty -> worker $HOME/fn-kv 
 KV_CAPACITY_GIB="${KV_CAPACITY_GIB:-500}"         # disk-free sanity floor
 KV_IO_THREADS="${KV_IO_THREADS:-6}"               # per-process NVMe io threads
 KV_PROMPT_ONLY="${KV_PROMPT_ONLY:-false}"         # false = persist generated turns too
+# true = re-enable the [fn-kv-offload] per-step diagnostics (lookup/scan/
+# store-skip/loadpath lines). Off by default: measured 09-21 at ~1200 log
+# lines/s = 6-12 ms of every 64-90 ms scheduler step.
+KV_OFFLOAD_DEBUG="${KV_OFFLOAD_DEBUG:-false}"
 # Hybrid-state cache mode for KV_OFFLOAD boots. align = state blocks per
 # hash chunk (REQUIRED for restores: the boundary state must exist on disk
 # per chunk; "none" keeps one running state per request, which no external
@@ -986,6 +990,7 @@ if $DO_LAUNCH; then
         KV_HEAD_MOUNTS="-v $KV_SPEC_HOST:/opt/fnkv/kvoffload/nvme_direct2.py:ro -v $KV_ROOT:/mnt/fn-kv"
         KV_WORKER_MOUNTS="-v /tmp/fnkv-nvme_direct2.py:/opt/fnkv/kvoffload/nvme_direct2.py:ro -v $KV_ROOT_WORKER:/mnt/fn-kv"
         KV_ENV="-e PYTHONHASHSEED=0 -e PYTHONPATH=/opt/fnkv"
+        [[ "$KV_OFFLOAD_DEBUG" == "true" ]] && KV_ENV+=" -e KV_OFFLOAD_DEBUG=1"
         # Overlay generators (house pattern: extract orig from image once,
         # regenerate from it every launch, fail loud on anchor drift).
         #  - offloading/config.py: assert -> classified receipt (insurance;
